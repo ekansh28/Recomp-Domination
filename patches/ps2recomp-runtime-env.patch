@@ -33,6 +33,44 @@ index 1eceb08..62a87c0 100644
          // IOP RAM is a distinct address space from the EE guest. TODO remove this later
          virtual bool readIopMemory(uint32_t address, void *destination, size_t size) const
          {
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index e09642e..b92089e 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -1,6 +1,7 @@
+ #include "iop_cpu.h"
+ #include "iop_memory.h"
+ 
++#include <iostream>
+ #include <limits>
+ 
+ namespace ps2x::iop::detail
+@@ -483,6 +484,25 @@ namespace ps2x::iop::detail
+ 
+         if (wasDelaySlot)
+         {
++            // Bounded trace: an indirect branch whose target leaves RAM is what
++            // produces "[IOP] execution outside RAM"; name the site here.
++            // Compare the physical target and ignore the sentinels: code is
++            // routinely fetched through the 0xA0000000 uncached alias, and a
++            // normal return branches to the call sentinel just below them.
++            const uint32_t physicalTarget = priorBranchTarget & 0x1FFFFFFFu;
++            if (physicalTarget >= 0x200000u && physicalTarget < 0x1FFFFF00u)
++            {
++                static uint32_t oobBranchTraceCount = 0u;
++                if (oobBranchTraceCount++ < 4u)
++                {
++                    std::cerr << "[IOP] branch out of RAM: branch_pc=0x" << std::hex << (pc - 4u)
++                              << " delay_pc=0x" << pc
++                              << " target=0x" << priorBranchTarget
++                              << " t9=0x" << cpu.gpr[25] << " ra=0x" << cpu.gpr[31]
++                              << " v0=0x" << cpu.gpr[2] << " a0=0x" << cpu.gpr[4]
++                              << std::dec << std::endl;
++                }
++            }
+             cpu.pc = priorBranchTarget;
+             cpu.branchPending = false;
+         }
 diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
 index 4832d8f..635342c 100644
 --- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
@@ -100,7 +138,7 @@ index 4832d8f..635342c 100644
          for (auto &[id, thread] : m_threads)
          {
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..ee7db8a 100644
+index e5f63a9..9a90f2f 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -23,6 +23,7 @@
@@ -123,7 +161,38 @@ index e5f63a9..ee7db8a 100644
              if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
                  return ImportDisposition::Handled;
              if (iequals(call.library, "sifman"))
-@@ -575,6 +581,15 @@ namespace ps2x::iop::detail
+@@ -345,6 +351,18 @@ namespace ps2x::iop::detail
+             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
+             if (target != 0u)
+             {
++                // Bounded trace: a resolved export that leaves RAM is one of the
++                // ways pc can end up outside it.
++                if ((target & 0x1FFFFFFFu) >= 0x200000u)
++                {
++                    static uint32_t importTargetTraceCount = 0u;
++                    if (importTargetTraceCount++ < 4u)
++                    {
++                        std::cerr << "[IOP] import target out of RAM: " << call.library
++                                  << ':' << call.ordinal << " target=0x" << std::hex << target
++                                  << " call_pc=0x" << cpu.pc << std::dec << std::endl;
++                    }
++                }
+                 cpu.pc = target;
+                 cpu.branchPending = false;
+                 return ImportDisposition::JumpToGuest;
+@@ -371,6 +389,11 @@ namespace ps2x::iop::detail
+             {
+                 std::ostringstream out;
+                 out << "[IOP] execution outside RAM pc=0x" << std::hex << cpu.pc;
++                // Capture what produced it: a return through $ra, a call through
++                // $t9, or the tail of a run of straight-line instructions.
++                out << " ra=0x" << cpu.gpr[31] << " t9=0x" << cpu.gpr[25]
++                    << " v0=0x" << cpu.gpr[2] << " sp=0x" << cpu.gpr[29]
++                    << " branchPending=" << std::dec << (cpu.branchPending ? 1 : 0);
+                 log(LogLevel::Error, out.str());
+                 cpu.stopped = true;
+                 return false;
+@@ -575,6 +598,15 @@ namespace ps2x::iop::detail
                          totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                          continue;
                      }

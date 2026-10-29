@@ -66,8 +66,16 @@ threads were never scheduled.
 ### Still open on this track
 
 - `cdvdman`/`cdvdfsv` parity, so the whole set can load.
-- The IOP faults during the first module's start with
-  `[IOP] execution outside RAM pc=0x200000`.
+- The IOP faults once during the first module's start with
+  `[IOP] execution outside RAM pc=0x200000`. It is not fatal — the remaining
+  modules load, their services register and the loader still completes — but the
+  cause is not yet pinned. Ruled out by instrumentation: an indirect branch
+  leaving RAM, and a resolved import jumping out of RAM (neither trace fires).
+  At the fault the registers are `ra=0x1020c` (inside the first module),
+  `sp=0xffffff28` — a stack pointer that is not a stack at all — `t9=0`,
+  `v0=1`, `branchPending=0`. So the module's start runs without the boot state
+  it expects: the emulator calls a module entry with a bare CPU state and a
+  synthesised stack, and nothing hands it a boot descriptor.
 - `ioman` reports `Unknown device '%s'` / `Known devices are`. The emulated
   ioman's device table is empty because the host HLE intercepts `AddDrv` and
   keeps the devices in its own table, so a driver module registering `cdrom`
