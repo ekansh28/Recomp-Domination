@@ -34,7 +34,7 @@ index 1eceb08..62a87c0 100644
          virtual bool readIopMemory(uint32_t address, void *destination, size_t size) const
          {
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
-index b498155..23f34c9 100644
+index b498155..9edea0b 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp
 +++ b/ps2xIOP/src/iop_subsystem.cpp
 @@ -5,8 +5,16 @@
@@ -181,7 +181,7 @@ index b498155..23f34c9 100644
          m_impl->emulator.runEeCycles(eeCycles);
      }
  
-@@ -191,11 +291,684 @@ namespace ps2x::iop
+@@ -191,11 +291,748 @@ namespace ps2x::iop
          {
              return true;
          }
@@ -244,8 +244,72 @@ index b498155..23f34c9 100644
 +        // The retail FILEIO client performs a four-byte initialization/
 +        // control transaction before the normal file path.  Its observed
 +        // request is a single guest pointer and the caller only consumes the
-+        // four-byte result.  Complete this control call without fabricating
-+        // file contents; later FILEIO operations remain visible if reached.
++        // four-byte result.
++        //
++        // Bounded trace of that client.  Each wrapper sends one 32-bit word and
++        // consumes one 32-bit word.  Log the word, and when it looks like a
++        // guest pointer also the C string it points at, so the resource the game
++        // asks for is visible instead of guessed.  Read-only: no response
++        // changes.
++        if (request.sid == 0x80000003u)
++        {
++            static uint32_t fileioTraceCount = 0u;
++            if (fileioTraceCount++ < 32u)
++            {
++                uint32_t word = 0u;
++                if (request.send.address != 0u && request.send.size >= sizeof(word))
++                {
++                    (void)m_impl->host.readGuest(request.send.address, &word, sizeof(word));
++                }
++
++                std::string text;
++                std::string words;
++                if (word >= 0x10000u)
++                {
++                    char buffer[128]{};
++                    if (m_impl->host.readGuest(word, buffer, sizeof(buffer) - 1u))
++                    {
++                        text.assign(buffer);
++                        for (char c : text)
++                        {
++                            if (c < 0x20 || c > 0x7e)
++                            {
++                                text.clear();
++                                break;
++                            }
++                        }
++
++                        uint32_t raw[8]{};
++                        if (m_impl->host.readGuest(word, raw, sizeof(raw)))
++                        {
++                            char line[128];
++                            for (int i = 0; i < 8; ++i)
++                            {
++                                std::snprintf(line, sizeof(line), " %08x", raw[i]);
++                                words += line;
++                            }
++                        }
++                    }
++                }
++
++                std::cerr << "[FILEIO] fn=" << request.function
++                          << " word=0x" << std::hex << word << std::dec
++                          << " send=" << request.send.size
++                          << " recv=" << request.receive.size;
++                if (!text.empty())
++                {
++                    std::cerr << " str=\"" << text << "\"";
++                }
++                if (!words.empty())
++                {
++                    std::cerr << " mem:" << words;
++                }
++                std::cerr << std::endl;
++            }
++        }
++
++        // Complete the control call without fabricating file contents; later
++        // FILEIO operations remain visible if reached.
 +        if (request.sid == 0x80000003u && request.function == 1u)
 +        {
 +            if (request.receive.address != 0u && request.receive.size != 0u)
