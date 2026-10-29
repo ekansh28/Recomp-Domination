@@ -1018,6 +1018,21 @@ index 589d768..d4a36af 100644
  if(PS2X_ENABLE_RUNTIME_LOGS)
      target_compile_definitions(ps2_runtime PUBLIC
          PS2_RUNTIME_LOGS=1
+diff --git a/ps2xRuntime/include/game_overrides.h b/ps2xRuntime/include/game_overrides.h
+index 3afaa31..117809e 100644
+--- a/ps2xRuntime/include/game_overrides.h
++++ b/ps2xRuntime/include/game_overrides.h
+@@ -32,6 +32,10 @@ namespace ps2_game_overrides
+     // Runtime helper for game-specific modules:
+     // bind an address to an existing syscall/stub handler by name.
+     bool bindAddressHandler(PS2Runtime &runtime, uint32_t address, std::string_view handlerName);
++
++    // Diagnostic only (PS2X_DIAG_FORCE_MOVIE_DONE): per-frame probe for the boot
++    // stall, called from the presenter. Never active unless the variable is set.
++    void diagFrameTick(uint8_t *rdram, PS2Runtime *runtime);
+ }
+ 
+ #define PS2_GAME_OVERRIDE_JOIN2(a, b) a##b
 diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
 index 94a6fa1..a6eb1ed 100644
 --- a/ps2xRuntime/include/ps2_call_list.h
@@ -2432,7 +2447,7 @@ index 5110ee2..cca003e 100644
      }
  }
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 1e38bd4..1d2f1c5 100644
+index 1e38bd4..e7672ae 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -4,9 +4,13 @@
@@ -2449,7 +2464,7 @@ index 1e38bd4..1d2f1c5 100644
  #include <iostream>
  #include <mutex>
  #include <optional>
-@@ -58,6 +62,73 @@ namespace
+@@ -58,6 +62,115 @@ namespace
          return leaf.string();
      }
  
@@ -2507,10 +2522,22 @@ index 1e38bd4..1d2f1c5 100644
 +                    // because its decode step feeds on the missing IPU block decoder.
 +                    // Retire the wait so the shell can move on to the front-end.
 +                    constexpr uint32_t kSceneWorkerDone = 0x29E344u;
++                    constexpr uint32_t kSceneWorkerThread = 0x29E33Cu;
 +                    if (*reinterpret_cast<uint32_t *>(rdram + kSceneWorkerDone) == 0u)
 +                    {
-+                        *reinterpret_cast<uint32_t *>(rdram + kSceneWorkerDone) = 1u;
-+                        std::cerr << "[DIAG] retired the opening scene worker (0x29E344=1)" << std::endl;
++                        // Experiment: the loader's worker sleeps in SleepThread and is
++                        // released only once, so its queue never drains. Wake it through
++                        // the guest's own ReleaseWaitThread and see whether the loader
++                        // then completes (this tests the missing-wakeup hypothesis; it
++                        // is not the production fix).
++                        const uint32_t workerId = *reinterpret_cast<uint32_t *>(rdram + kSceneWorkerThread);
++                        if (workerId != 0u && workerId != 0xFFFFFFFFu)
++                        {
++                            R5900Context wake = *ctx;
++                            SET_GPR_U32(&wake, 4, workerId);
++                            ps2_syscalls::ReleaseWaitThread(rdram, &wake, runtime);
++                            std::cerr << "[DIAG] released scene worker id=" << workerId << std::endl;
++                        }
 +                    }
 +                    std::cerr << "[DIAG] set player state=3 (poll " << s_polls << ")" << std::endl;
 +                }
@@ -2520,10 +2547,52 @@ index 1e38bd4..1d2f1c5 100644
 +        setReturnS32(ctx, 0); // the shell's "is a pad button pressed" test
 +    }
 +
++    // Per-frame diagnostic hook (see PS2X_DIAG_FORCE_MOVIE_DONE). Runs from the
++    // presenter, so it keeps working after the shell leaves the opening loop where
++    // the pad-poll override stops being called. Diagnostic only.
++    void diagFrameTickImpl(uint8_t *rdram, PS2Runtime *runtime)
++    {
++        (void)runtime;
++        if (rdram == nullptr)
++            return;
++        constexpr uint32_t kShellOpeningDone = 0x4BD710u;
++        constexpr uint32_t kSceneWorkerDone = 0x29E344u;
++        constexpr uint32_t kSceneWorkerThread = 0x29E33Cu;
++
++        if (*reinterpret_cast<uint32_t *>(rdram + kShellOpeningDone) == 0u)
++            *reinterpret_cast<uint32_t *>(rdram + kShellOpeningDone) = 1u;
++
++        if (*reinterpret_cast<uint32_t *>(rdram + kSceneWorkerDone) == 0u)
++        {
++            const uint32_t workerId = *reinterpret_cast<uint32_t *>(rdram + kSceneWorkerThread);
++            if (workerId != 0u && workerId != 0xFFFFFFFFu)
++            {
++                R5900Context wake{};
++                SET_GPR_U32(&wake, 4, workerId);
++                ps2_syscalls::ReleaseWaitThread(rdram, &wake, runtime);
++                static uint32_t s_releaseTrace = 0u;
++                if (s_releaseTrace++ < 8u)
++                    std::cerr << "[DIAG] per-frame release of scene worker id=" << workerId << std::endl;
++            }
++        }
++    }
++
      std::optional<PS2Runtime::RecompiledFunction> resolveHandlerByName(std::string_view handlerName)
      {
          const std::string_view resolvedSyscall = ps2_runtime_calls::resolveSyscallName(handlerName);
-@@ -125,6 +196,32 @@ namespace ps2_game_overrides
+@@ -89,6 +202,11 @@ namespace
+ }
+ namespace ps2_game_overrides
+ {
++    void diagFrameTick(uint8_t *rdram, PS2Runtime *runtime)
++    {
++        diagFrameTickImpl(rdram, runtime);
++    }
++
+     AutoRegister::AutoRegister(const Descriptor &descriptor)
+     {
+         registerDescriptor(descriptor);
+@@ -125,6 +243,32 @@ namespace ps2_game_overrides
                         uint32_t fileCrc32,
                         bool fileCrcValid)
      {
@@ -3522,7 +3591,7 @@ index 8590f14..d5c9e72 100644
      data[3] = static_cast<uint8_t>(btns >> 8);
      return true;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..eb08c5e 100644
+index 45cb9d2..4e00eb6 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,4 +1,7 @@
@@ -3758,7 +3827,7 @@ index 45cb9d2..eb08c5e 100644
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
      // this charge bounds straight-line call chains that have no local loop.
-@@ -2386,8 +2557,25 @@ void PS2Runtime::run()
+@@ -2386,8 +2557,29 @@ void PS2Runtime::run()
          gameThreadFinished.store(true, std::memory_order_release); });
  
      uint64_t tick = 0;
@@ -3768,6 +3837,10 @@ index 45cb9d2..eb08c5e 100644
 +    bool dumpRamDone = (dumpRamSpec == nullptr);
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
++        if (std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE") != nullptr)
++        {
++            ps2_game_overrides::diagFrameTick(m_memory.getRDRAM(), this);
++        }
 +        if (!dumpRamDone)
 +        {
 +            const std::string spec(dumpRamSpec);
@@ -3784,7 +3857,7 @@ index 45cb9d2..eb08c5e 100644
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2418,6 +2606,21 @@ void PS2Runtime::run()
+@@ -2418,6 +2610,21 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -3806,7 +3879,7 @@ index 45cb9d2..eb08c5e 100644
              }
          });
          uint32_t presentWidth = FB_WIDTH;
-@@ -2448,9 +2651,15 @@ void PS2Runtime::run()
+@@ -2448,9 +2655,15 @@ void PS2Runtime::run()
  
          if (WindowShouldClose())
          {
