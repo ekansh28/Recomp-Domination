@@ -12,24 +12,44 @@ The routine that was blamed (`FUN_0021AC08`) zeroes the word it was supposed to
 be stuck on as its very first action (`sw $zero, 0x0($s0)`), so it cannot be
 spinning on that word.
 
+## It only happens with the IOP modules loaded
+
+This matters, and it invalidated an earlier round of measurements. Measured over
+the same 16 s window:
+
+| run | `0x21ac80` | CD reads | shell entries |
+| --- | --- | --- | --- |
+| default (no boot modules) | 0 | 246 | 6 |
+| with the boot modules | ~350000 | 525 | 12 |
+
+Loading the game's own IOP services takes the game **further** — more than twice
+the CD reads, twice the shell passes — and lands it here. So this stall is a
+later stage than the one the modules-are-neutral measurement suggested, and any
+watch or trace aimed at it has to be run with the modules loaded.
+
 ## What it is
 
-`FUN_0021AC08` is entered three times per run, and the whole bin-builder chain
-around it runs three times (`FUN_001BAD48` seven). The million repeats are an
-**inner poll loop**:
+`FUN_0021AE70(set, descriptor)` is a **table lookup**. It returns the index of a
+matching entry, or the first free index, or `-1` for "not found". The key comes
+from bits 32..37 of the 64-bit tag at `descriptor+8`; the search walks 8-byte
+entries at `set+0xC` and compares against that key, and the empty-table gate is
+a `blez` on the count word at `set+0`.
 
-```
-loop:
-    $a1 = $s1                    ; the table pointer for this record
-    $a0 = $s0                    ; the set object
-    $v0 = FUN_0021AE70($a0, $a1)
-    if ($v0 != -1) goto 0x21AE08 ; consumed something
-    goto loop                    ; nothing yet - ask again
-```
+So `-1` is normal control flow — "absent", after which the caller appends — not
+an error. The inner block at `0x21ac80` runs it about 350000 times in one call
+because the descriptor it is handed never yields a hit.
 
-`FUN_0021AE70` is asked for the next item and answers `-1` every single time.
-The loop is a waiter, not a stuck cursor: the producer it is waiting on never
-produces.
+## Why it never yields a hit
+
+The descriptor pointer is computed as `set + ([set+4] << 4)`. With `[set+4]`
+zero the descriptor pointer lands on the header itself, where the 64-bit word at
+`+8` is not a tag at all, so no lookup can ever match.
+
+`[set+4]` is the header size in 16-byte units — `1` for a 16-byte header — and
+**nothing in the recompiled runner writes it**. An exhaustive search of the
+runner for stores to that field found only readers (`FUN_0021AC08`, `FUN_0021A5C8`,
+`FUN_002197F0`). The set-builder writes the count at `+0` and the entries, and
+never its own header size.
 
 ## What is known about the producer
 
@@ -69,8 +89,18 @@ the object.
 
 ## Next step
 
-Find `FUN_0021AE70`'s data source and what feeds it — that is the producer that
-never runs — and the code that should write the header's `+4` before the
-consumer pass runs. Instrument the read that returns `-1` (its comparison
-against the sentinel) rather than the loop, and trace which structure it
-consults and who was supposed to write it.
+Find where the set's header is supposed to be initialised — the code that writes
+`[set+4] = 1` before the consumer pass runs — or show that the header is meant to
+arrive as data (a blob copied into the freshly allocated set) and that the copy
+is the missing step.
+
+Two ways in:
+
+1. Watch the resolved set address with the boot modules loaded (the address
+   differs between configurations — an earlier watch used the address from a
+   modules-off run and therefore observed nothing). A watch on the count word at
+   `set+0` should fire from the builder's own clears; if it does not, the address
+   being watched is still wrong.
+2. Decompile the set's allocation path (`FUN_0020d2d8` and the pool allocator it
+   uses) and the caller that feeds it, and check whether the header word is
+   written from a register that is zero in our run and non-zero on hardware.
