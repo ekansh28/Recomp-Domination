@@ -1213,7 +1213,7 @@ index 67c8184..bcda1c1 100644
      float normalizeOperand(float value) const;
      float normalizeResult(float value, uint32_t &laneFlags) const;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..462296e 100644
+index c5e31c4..b7f7fe7 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -106,6 +106,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
@@ -1298,7 +1298,24 @@ index c5e31c4..462296e 100644
      {
          return KE_ILLEGAL_PRIORITY;
      }
-@@ -1243,6 +1271,11 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+@@ -790,6 +818,16 @@ int EeScheduler::releaseWait(int id, bool interruptSafe)
+     }
+     if (target->status != EeThreadStatus::Waiting && target->status != EeThreadStatus::WaitingSuspended)
+     {
++        // A release can arrive just before the thread blocks: a lower-priority
++        // thread cannot run while the caller runs, so a ReleaseWaitThread issued
++        // right after StartThread is dropped by the strict kernel rules and the
++        // target then sleeps forever. Latch it for a thread that has not run into
++        // a wait yet; sleepCurrent consumes the latch and returns immediately.
++        // The kernel's own return value (KE_NOT_WAIT) is preserved.
++        if (target->status == EeThreadStatus::Ready && target->wait.reason == EeWaitReason::None)
++        {
++            ++target->wakeupCount;
++        }
+         return KE_NOT_WAIT;
+     }
+     removeFromWaitObject(*target);
+@@ -1243,6 +1281,11 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
          if (enabled)
          {
              mask |= 1u << cause;
@@ -1310,7 +1327,7 @@ index c5e31c4..462296e 100644
          }
          else
          {
-@@ -1258,6 +1291,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+@@ -1258,6 +1301,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
      const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
      if (cause < 32u && (mask & (1u << cause)) == 0u)
      {
