@@ -27,6 +27,31 @@ for f in "${ROOT_FILES[@]}"; do
   [ -f "game/$f" ] || { echo "erro: game/$f não foi extraído da ISO" >&2; exit 1; }
 done
 
+# A imagem do IOP é um contêiner com os módulos do kernel em sequência (ELF).
+# O runtime carrega cada um no IOP emulado, para os serviços de verdade
+# (fileio, cdvdman, ioman, ...) responderem no lugar dos stubs HLE.
+IOP_NAMES=(loadcore sifcmd sifman threadman ioman modload fileio cdvdman
+           cdvdfsv loadfile timemani romdrv eesync sysclib stdio)
+python3 - game/IOPRP270.IMG game/iopmod "${IOP_NAMES[@]}" <<'PY'
+import pathlib, sys
+
+source = pathlib.Path(sys.argv[1]).read_bytes()
+destination = pathlib.Path(sys.argv[2])
+names = sys.argv[3:]
+
+magic = b"\x7fELF"
+offsets = [i for i in range(len(source) - 4) if source[i:i + 4] == magic]
+if not offsets:
+    raise SystemExit("erro: nenhum módulo ELF encontrado em " + sys.argv[1])
+
+destination.mkdir(parents=True, exist_ok=True)
+for index, start in enumerate(offsets):
+    end = offsets[index + 1] if index + 1 < len(offsets) else len(source)
+    name = names[index] if index < len(names) else f"mod{index}"
+    (destination / f"{index:02d}_{name}.elf").write_bytes(source[start:end])
+print(f"iopmod: {len(offsets)} módulos extraídos para {destination}")
+PY
+
 if [ ! -d PS2Recomp ]; then
   git clone --recurse-submodules https://github.com/ran-j/PS2Recomp
   git -C PS2Recomp checkout -q 2c5fbb9   # commit em que patches/ aplica limpo
