@@ -33,6 +33,129 @@ index 1eceb08..62a87c0 100644
          // IOP RAM is a distinct address space from the EE guest. TODO remove this later
          virtual bool readIopMemory(uint32_t address, void *destination, size_t size) const
          {
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..635342c 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <iostream>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -54,6 +55,17 @@ namespace ps2x::iop::detail
+             thread.stackSize = std::max<uint32_t>(m_memory.read32(descriptor + 12u), 0x100u);
+             thread.priority = std::clamp<uint32_t>(m_memory.read32(descriptor + 16u), 1u, 126u);
+             thread.initialPriority = thread.priority;
++            // Bounded trace: modules start their service loop on a thread they
++            // create, so this shows how far a module's start routine got.
++            static uint32_t createThreadTraceCount = 0u;
++            if (createThreadTraceCount++ < 24u)
++            {
++                std::cerr << "[IOP] CreateThread entry=0x" << std::hex << thread.entry
++                          << std::dec << " prio=" << thread.priority
++                          << " kernel=" << static_cast<const void *>(this)
++                          << " threads=" << m_threads.size() << std::endl;
++            }
++
+             thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
+             if (thread.stackBase == 0u)
+             {
+@@ -91,6 +103,14 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             IopThread &thread = it->second;
++            // Bounded trace: a module only runs its service loop once the
++            // thread it created is actually started.
++            static uint32_t startThreadTraceCount = 0u;
++            if (startThreadTraceCount++ < 24u)
++            {
++                std::cerr << "[IOP] StartThread id=" << thread.id
++                          << " entry=0x" << std::hex << thread.entry << std::dec << std::endl;
++            }
+             thread.cpu = {};
+             thread.cpu.pc = thread.entry;
+             thread.cpu.gpr[4] = cpu.gpr[5];
+@@ -677,6 +697,20 @@ namespace ps2x::iop::detail
+                 thread.state = IopThreadState::Ready;
+         }
+ 
++        // Bounded trace of what the scheduler can see, so "no thread runs" can
++        // be told apart from "no thread is ready".
++        static uint32_t scheduleTraceCount = 0u;
++        if (m_threads.empty() == false && scheduleTraceCount++ < 8u)
++        {
++            std::cerr << "[IOP] beginNextReady kernel=" << static_cast<const void *>(this)
++                      << " threads=" << m_threads.size() << " states:";
++            for (const auto &[id, thread] : m_threads)
++            {
++                std::cerr << ' ' << id << '=' << static_cast<int>(thread.state);
++            }
++            std::cerr << std::endl;
++        }
++
+         IopThread *next = nullptr;
+         for (auto &[id, thread] : m_threads)
+         {
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..e536b4d 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -23,6 +23,7 @@
+ #include <optional>
+ #include <span>
+ #include <sstream>
++#include <iostream>
+ #include <utility>
+ 
+ namespace ps2x::iop::detail
+@@ -575,6 +576,15 @@ namespace ps2x::iop::detail
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
++                    // Bounded trace of which IOP thread the scheduler picked, so
++                    // it is visible whether threads a module created ever run.
++                    static uint32_t threadRunTraceCount = 0u;
++                    if (threadRunTraceCount++ < 24u)
++                    {
++                        std::cerr << "[IOP] run thread id=" << next->id
++                                  << " pc=0x" << std::hex << next->cpu.pc << std::dec << std::endl;
++                    }
++
+                     const uint64_t before = totalCycles;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..63ce7f3 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <iostream>
+ #include <limits>
+ #include <vector>
+ 
+@@ -220,6 +221,16 @@ namespace ps2x::iop::detail
+             server.callback = m_memory.read32(stackPointer + 16u);
+             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
+             server.queue = m_memory.read32(stackPointer + 24u);
++
++            // Bounded trace: a module registering an SID is what lets it take
++            // that service over from the runtime's HLE stub, so make it visible.
++            static uint32_t registerRpcTraceCount = 0u;
++            if (registerRpcTraceCount++ < 32u)
++            {
++                std::cerr << "[IOP] sceSifRegisterRpc sid=0x" << std::hex << server.sid
++                          << " handler=0x" << server.function << std::dec << std::endl;
++            }
++
+             m_servers[server.sid] = server;
+             if (server.serverData != 0u)
+             {
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
 index b498155..7bcbf66 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp
@@ -1126,7 +1249,7 @@ index 94a6fa1..a6eb1ed 100644
      X(calloc_r)                               \
      X(free_r)                                 \
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..ce44318 100644
+index 4b9242c..63c1068 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -246,13 +246,27 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
@@ -1168,9 +1291,9 @@ index 4b9242c..ce44318 100644
      void run();
  
 +    // Load the IOP kernel modules shipped inside the game's IOP image into the
-+    // emulated IOP, so the retail services (fileio, cdvdman, ioman, ...) answer
-+    // the guest instead of falling through to the HLE stubs.  Opt-in through
-+    // PS2X_IOP_MODULES until those services reach parity with the HLE path.
++    // emulated IOP, so the retail services (fileio, ioman, threadman, ...)
++    // answer the guest instead of falling through to the HLE stubs.  Called
++    // from run() because resetIop() there tears down anything loaded earlier.
 +    void loadIopBootModules();
 +
      [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
@@ -3774,7 +3897,7 @@ index 8590f14..d5c9e72 100644
      data[3] = static_cast<uint8_t>(btns >> 8);
      return true;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..22d7f93 100644
+index 45cb9d2..175012f 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,4 +1,7 @@
@@ -3832,7 +3955,7 @@ index 45cb9d2..22d7f93 100644
      s_lastDisplayFbp = displayFbp;
      s_lastSourceFbp = sourceFbp;
      s_lastPreferred = usedPreferredDisplaySource;
-@@ -564,6 +607,51 @@ PS2Runtime::~PS2Runtime()
+@@ -564,6 +607,71 @@ PS2Runtime::~PS2Runtime()
      }
  }
  
@@ -3842,33 +3965,53 @@ index 45cb9d2..22d7f93 100644
 +    // ELF by setup.sh (game/iopmod/NN_name.elf); modules load in filename
 +    // order, which is the image order.
 +    //
-+    // Opt-in: all fifteen modules do load into the emulated IOP, but the ones
-+    // that take over a bound SID from the HLE set (cdvdman above all) do not
-+    // yet serve the guest as well as the HLE path does, and the boot loader
-+    // stops completing.  Until those services are at parity, keep this behind
-+    // PS2X_IOP_MODULES=<directory> so the default run is unaffected.
++    // Loading them gives the guest the real file/ioman/threadman services
++    // (measured: sifcmd registers SIDs 0x80000001, 0x80000003 and 0x80000006, so
++    // no RPC falls through to the HLE stub any more and the file handles the
++    // game opens are real).
++    //
++    // cdvdman and cdvdfsv are skipped: they take the CD SIDs off the runtime's
++    // HLE CD path and do not drive it well enough to finish booting (the loader
++    // stops completing with them loaded).  Everything else is load-compatible.
++    //
++    // PS2X_IOP_MODULES selects a different module directory; PS2X_IOP_MODULES=0
++    // disables the load entirely.
 +    const char *overrideDirectory = std::getenv("PS2X_IOP_MODULES");
-+    if (overrideDirectory == nullptr || *overrideDirectory == '\0')
++    const bool explicitlyDisabled =
++        overrideDirectory != nullptr &&
++        (std::string_view(overrideDirectory) == "0" ||
++         std::string_view(overrideDirectory) == "off");
++    if (explicitlyDisabled)
 +    {
 +        return;
 +    }
 +
-+    const std::filesystem::path directory{overrideDirectory};
++    const IoPaths &ioPaths = getIoPaths();
++    const std::filesystem::path directory =
++        (overrideDirectory != nullptr && *overrideDirectory != '\0')
++            ? std::filesystem::path(overrideDirectory)
++            : ioPaths.elfDirectory / "iopmod";
 +
 +    std::error_code error;
 +    if (!std::filesystem::is_directory(directory, error))
 +    {
-+        std::cerr << "[IOP boot] not a directory: " << directory.string() << std::endl;
 +        return;
 +    }
 +
 +    std::vector<std::filesystem::path> modules;
 +    for (const auto &entry : std::filesystem::directory_iterator(directory, error))
 +    {
-+        if (entry.is_regular_file(error) && entry.path().extension() == ".elf")
++        if (!entry.is_regular_file(error) || entry.path().extension() != ".elf")
 +        {
-+            modules.push_back(entry.path());
++            continue;
 +        }
++        const std::string name = entry.path().filename().string();
++        if (name.find("cdvdman") != std::string::npos ||
++            name.find("cdvdfsv") != std::string::npos)
++        {
++            continue;
++        }
++        modules.push_back(entry.path());
 +    }
 +    std::sort(modules.begin(), modules.end());
 +
@@ -3884,7 +4027,7 @@ index 45cb9d2..22d7f93 100644
  ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
  {
      auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
-@@ -607,7 +695,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+@@ -607,7 +715,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
  
  void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
  {
@@ -3904,7 +4047,7 @@ index 45cb9d2..22d7f93 100644
  }
  
  void PS2Runtime::resetIop()
-@@ -650,6 +749,38 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+@@ -650,6 +769,38 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
      return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
  }
  
@@ -3943,7 +4086,7 @@ index 45cb9d2..22d7f93 100644
  bool PS2Runtime::syncCoreSubsystems()
  {
      uint8_t *const rdram = m_memory.getRDRAM();
-@@ -679,9 +810,14 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -679,9 +830,14 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
@@ -3958,7 +4101,7 @@ index 45cb9d2..22d7f93 100644
                                       cpuContext->vu0_vpu_stat =
                                           (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                           (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -697,9 +833,14 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -697,9 +853,14 @@ bool PS2Runtime::syncCoreSubsystems()
                                           (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                       m_vu1.state().tBitEnabled =
                                           (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
@@ -3973,15 +4116,7 @@ index 45cb9d2..22d7f93 100644
                                       cpuContext->vu0_vpu_stat =
                                           (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                           (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -1002,6 +1143,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
-     }
- 
-     m_iopSubsystem->reset();
-+    loadIopBootModules();
- 
-     ps2_game_overrides::applyMatching(*this,
-                                       elfPath,
-@@ -1065,6 +1207,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1065,6 +1226,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
  
@@ -3993,7 +4128,7 @@ index 45cb9d2..22d7f93 100644
      setIoPaths(paths);
  }
  
-@@ -1353,6 +1500,76 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1353,6 +1519,76 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
  
@@ -4070,7 +4205,18 @@ index 45cb9d2..22d7f93 100644
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
      // this charge bounds straight-line call chains that have no local loop.
-@@ -2386,8 +2603,29 @@ void PS2Runtime::run()
+@@ -2344,6 +2580,10 @@ void PS2Runtime::run()
+     m_stopRequested.store(false, std::memory_order_relaxed);
+     ps2_stubs::resetSifState();
+     resetIop();
++    // resetIop() tears the IOP down, so the boot modules have to be loaded
++    // here rather than in loadELF: anything loaded there is discarded before the
++    // IOP scheduler ever runs, leaving its thread map empty.
++    loadIopBootModules();
+     ps2_stubs::resetAudioStubState();
+     ps2_stubs::resetMpegStubState();
+     initializeEeKernelState(m_memory.getRDRAM());
+@@ -2386,8 +2626,29 @@ void PS2Runtime::run()
          gameThreadFinished.store(true, std::memory_order_release); });
  
      uint64_t tick = 0;
@@ -4100,7 +4246,7 @@ index 45cb9d2..22d7f93 100644
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2418,6 +2656,21 @@ void PS2Runtime::run()
+@@ -2418,6 +2679,21 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -4122,7 +4268,7 @@ index 45cb9d2..22d7f93 100644
              }
          });
          uint32_t presentWidth = FB_WIDTH;
-@@ -2448,9 +2701,15 @@ void PS2Runtime::run()
+@@ -2448,9 +2724,15 @@ void PS2Runtime::run()
  
          if (WindowShouldClose())
          {

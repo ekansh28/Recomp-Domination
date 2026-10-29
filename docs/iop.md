@@ -32,48 +32,47 @@ does not otherwise have them.
 ## Loading them
 
 `PS2X_IOP_MODULES=<directory>` makes the runtime load every `*.elf` in that
-directory into the emulated IOP, in filename order, right after the IOP reset
-in `loadELF`. All fifteen load (`[IOP boot] NN_name.elf handled=1 id=N`).
+directory into the emulated IOP, in filename order, right after the IOP reset in
+`PS2Runtime::run()` (see below). All fifteen load
+(`[IOP boot] NN_name.elf handled=1 id=N`).
 
-**It is opt-in, and currently regresses.** The modules that take over a SID the
-HLE set already answers — `cdvdman` above all — do not yet serve the guest as
-well as the HLE path, and the boot loader stops completing (`workerDone=0`).
-Until those services reach parity this stays behind the variable so the default
-run is unaffected.
+**This is on by default**, with `cdvdman` and `cdvdfsv` skipped. Everything else
+is load-compatible: the boot loader still completes and the HLE CD path still
+serves its reads. `cdvdman` is the exception — it takes the CD SIDs off the HLE
+and does not drive the CD path well enough to finish booting, so with it loaded
+the loader stops completing (`workerDone=0`). `PS2X_IOP_MODULES=<dir>` selects a
+different module directory and `PS2X_IOP_MODULES=0` disables the load.
 
-The module entry points do run — the emulator calls each module's entry after
-loading, and `cdvdman` reaches its own init far enough to print `cdvdman Init`
-through the IOP printf hook. Their imports all resolve as well; a run produces
-no `[IOP] unhandled import` warning.
+The result, measured on a default run: `sifcmd` registers three servers —
+`0x80000006` (threadman), `0x80000001` (ioman) and `0x80000003` (fileio, handler
+at `0x26254`) — and **no RPC falls through to the HLE stub any more**. The file
+handles the game opens are real values now instead of the zero the stub
+returned.
 
-**`cdvdman` is what regresses the loader.** Loading the rest of the stack
-(loadcore, sifcmd, sifman, threadman, ioman, modload, fileio, loadfile,
-timemani, romdrv, eesync, sysclib, stdio — everything except `cdvdman` and
-`cdvdfsv`) leaves the boot loader completing and the HLE CD path serving reads
-exactly as before. `cdvdman` is the module that takes the CD SIDs away from the
-HLE, and it does not drive the CD path well enough to finish booting.
+### The load has to happen after the run-time IOP reset
 
-**No module registers an RPC server**, so `hasRpcServer(sid)` stays false for
-every SID and nothing can take over from the HLE. The modules run, their
-imports resolve, and `sifman`'s `sceSifRegisterRpc` is implemented in the
-emulator — but no module ends up reaching it, so the registration itself is
-where to look next (most likely each module registers from its own thread, and
-module-created threads are not being driven).
+Loading the modules from `loadELF` looked like it worked — the modules loaded,
+their entry points ran, and they created and started threads — but the
+scheduler's thread map was always empty and nothing ever ran. `PS2Runtime::run()`
+calls `resetIop()` as its first act, and that walks `IopSubsystem::reset()` →
+`IopEmulator::reset()` → `Impl::reset()`, which clears the kernel's threads, the
+module list and the import registry. Everything `loadELF` had loaded was
+discarded before the IOP scheduler first ran. The load now happens in `run()`,
+straight after that reset.
 
-Two further faults to fix on this track:
+That was the whole reason no module ever registered a server: their service
+threads were never scheduled.
 
-1. The IOP faults during the first module's start with
-   `[IOP] execution outside RAM pc=0x200000`; whatever the runtime initialises
-   the IOP with is not enough for `loadcore` to complete cleanly.
-2. `ioman` reports `Unknown device '%s'` / `Known devices are`, so the device
-   table a module registers is not reaching it.
+### Still open on this track
 
-`IopSubsystem::canBindRpc` logs `[IOP] emulated RPC server for sid=...`
-whenever a loaded module does own a SID, so this is measurable rather than
-guessed.
+- `cdvdman`/`cdvdfsv` parity, so the whole set can load.
+- The IOP faults during the first module's start with
+  `[IOP] execution outside RAM pc=0x200000`.
+- `ioman` reports `Unknown device '%s'` / `Known devices are`.
 
-Next step for this track: give the emulated IOP a working boot state so
-`loadcore` completes, then confirm servers start appearing.
+`IopSubsystem::canBindRpc` logs `[IOP] emulated RPC server for sid=...` whenever
+a loaded module owns a SID, and the kernel traces thread creation, starting and
+scheduling, so all of this is measurable rather than guessed.
 
 ## The FILEIO client in the game
 
