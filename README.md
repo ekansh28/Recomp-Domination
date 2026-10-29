@@ -49,8 +49,12 @@ Not working yet:
   [docs/performance.md](docs/performance.md) for measurements and what helped).
 - **Crash on late X:** pressing X on the title after it has been idle for a while ends in a
   guest call through a garbage pointer (pre-existing; see the same document).
-- **Intro movie:** skipped. The game feeds the IPU by DMA, which the runtime does
-  not emulate.
+- **Intro movie / attract PSS:** not decoded. The game's own MPEG-2 player drives the
+  EE IPU (bitstream fetch through `IPU_CMD`/`IPU_BP`, input and output through the IPU
+  DMA channels); the runtime models the IPU registers as inert and has no IPU DMA, so
+  the elementary stream never parses. The FFmpeg-backed `sceMpeg` HLE is not reachable
+  because this game does not call the SDK API. See
+  [docs/mpeg-playback.md](docs/mpeg-playback.md).
 - **Sound:** disabled at the EE level. The game's sound IOP module cannot read
   the disc inside the emulated IOP.
 
