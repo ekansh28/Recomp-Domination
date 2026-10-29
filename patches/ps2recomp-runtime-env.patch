@@ -2447,7 +2447,7 @@ index 5110ee2..cca003e 100644
      }
  }
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 1e38bd4..d6b4697 100644
+index 1e38bd4..d0be624 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -4,9 +4,13 @@
@@ -2464,7 +2464,7 @@ index 1e38bd4..d6b4697 100644
  #include <iostream>
  #include <mutex>
  #include <optional>
-@@ -58,6 +62,107 @@ namespace
+@@ -58,6 +62,111 @@ namespace
          return leaf.string();
      }
  
@@ -2567,12 +2567,16 @@ index 1e38bd4..d6b4697 100644
 +                    std::cerr << "[DIAG] per-frame release of scene worker id=" << workerId << std::endl;
 +            }
 +        }
++
++        // (A state nudge from 0x0C to 0x14 was tried and is useless while the loader
++        // thread owns the CPU: the shell dispatcher FUN_001b6708 does not run per
++        // frame then, and FUN_001BA3B8 additionally needs [shell+0x288] >= 2.)
 +    }
 +
      std::optional<PS2Runtime::RecompiledFunction> resolveHandlerByName(std::string_view handlerName)
      {
          const std::string_view resolvedSyscall = ps2_runtime_calls::resolveSyscallName(handlerName);
-@@ -89,6 +194,11 @@ namespace
+@@ -89,6 +198,11 @@ namespace
  }
  namespace ps2_game_overrides
  {
@@ -2584,7 +2588,7 @@ index 1e38bd4..d6b4697 100644
      AutoRegister::AutoRegister(const Descriptor &descriptor)
      {
          registerDescriptor(descriptor);
-@@ -125,6 +235,32 @@ namespace ps2_game_overrides
+@@ -125,6 +239,32 @@ namespace ps2_game_overrides
                         uint32_t fileCrc32,
                         bool fileCrcValid)
      {
