@@ -68,7 +68,14 @@ threads were never scheduled.
 - `cdvdman`/`cdvdfsv` parity, so the whole set can load.
 - The IOP faults during the first module's start with
   `[IOP] execution outside RAM pc=0x200000`.
-- `ioman` reports `Unknown device '%s'` / `Known devices are`.
+- `ioman` reports `Unknown device '%s'` / `Known devices are`. The emulated
+  ioman's device table is empty because the host HLE intercepts `AddDrv` and
+  keeps the devices in its own table, so a driver module registering `cdrom`
+  never reaches the emulated module. Letting the loaded guest ioman own those
+  imports was tried and **regresses the loader** (`workerDone` stays 0 and the
+  CD read count drops from 525 to 414), so the HLE still answers ioman. The
+  message is cosmetic for the HLE CD path, which never consults ioman; it only
+  matters for opens that go through the emulated ioman.
 
 `IopSubsystem::canBindRpc` logs `[IOP] emulated RPC server for sid=...` whenever
 a loaded module owns a SID, and the kernel traces thread creation, starting and

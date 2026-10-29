@@ -100,7 +100,7 @@ index 4832d8f..635342c 100644
          for (auto &[id, thread] : m_threads)
          {
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..e536b4d 100644
+index e5f63a9..ee7db8a 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -23,6 +23,7 @@
@@ -111,7 +111,19 @@ index e5f63a9..e536b4d 100644
  #include <utility>
  
  namespace ps2x::iop::detail
-@@ -575,6 +576,15 @@ namespace ps2x::iop::detail
+@@ -314,6 +315,11 @@ namespace ps2x::iop::detail
+                 setV0(0);
+                 return ImportDisposition::Handled;
+             }
++            // The host HLE answers ioman for now.  Letting the loaded guest
++            // ioman own it (so driver modules registering a device would reach
++            // its own table) was tried and regresses the boot loader:
++            // workerDone stays 0 and the CD read count drops.  Revisit once the
++            // guest ioman can be driven well enough.
+             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman"))
+@@ -575,6 +581,15 @@ namespace ps2x::iop::detail
                          totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                          continue;
                      }
