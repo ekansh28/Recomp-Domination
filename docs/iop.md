@@ -41,8 +41,25 @@ well as the HLE path, and the boot loader stops completing (`workerDone=0`).
 Until those services reach parity this stays behind the variable so the default
 run is unaffected.
 
-Next step for this track: make the emulated `cdvdman`/`fileio` serve their RPCs
-as well as the HLE stubs do, then flip the default over.
+The module entry points do run — the emulator calls each module's entry after
+loading, and `cdvdman` reaches its own init far enough to print `cdvdman Init`
+through the IOP printf hook. But **no module registers an RPC server**, so
+`hasRpcServer(sid)` stays false for every SID and nothing can take over from the
+HLE. Two things stand in the way, in order:
+
+1. The IOP faults during the first module's start with
+   `[IOP] execution outside RAM pc=0x200000`; whatever the runtime initialises
+   the IOP with is not enough for `loadcore` to complete cleanly.
+2. Services register through `sceSifRegisterRpc` from a thread the module
+   creates — that needs the module's `threadman`/`sifman` peers to be running,
+   which in turn depends on (1).
+
+`IopSubsystem::canBindRpc` logs `[IOP] emulated RPC server for sid=...`
+whenever a loaded module does own a SID, so this is measurable rather than
+guessed.
+
+Next step for this track: give the emulated IOP a working boot state so
+`loadcore` completes, then confirm servers start appearing.
 
 ## The FILEIO client in the game
 

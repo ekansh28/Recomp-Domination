@@ -34,7 +34,7 @@ index 1eceb08..62a87c0 100644
          virtual bool readIopMemory(uint32_t address, void *destination, size_t size) const
          {
 diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
-index b498155..374d6cd 100644
+index b498155..7bcbf66 100644
 --- a/ps2xIOP/src/iop_subsystem.cpp
 +++ b/ps2xIOP/src/iop_subsystem.cpp
 @@ -5,8 +5,16 @@
@@ -181,7 +181,20 @@ index b498155..374d6cd 100644
          m_impl->emulator.runEeCycles(eeCycles);
      }
  
-@@ -191,11 +291,751 @@ namespace ps2x::iop
+@@ -187,15 +287,764 @@ namespace ps2x::iop
+ 
+     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
+     {
++        // A server registered by a module loaded into the emulated IOP owns its
++        // SID.  Log which endpoints those are, so it is visible whether a load
++        // actually took effect instead of silently falling back to HLE.
++        if (m_impl->emulator.hasRpcServer(sid))
++        {
++            std::cerr << "[IOP] emulated RPC server for sid=0x" << std::hex << sid
++                      << std::dec << std::endl;
++        }
++
+         if (m_impl->routes.find(sid) != m_impl->routes.end())
          {
              return true;
          }
