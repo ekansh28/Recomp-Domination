@@ -2377,48 +2377,6 @@ index 5110ee2..cca003e 100644
          releaseWaitImpl(rdram, ctx, runtime, true);
      }
  }
-diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 1e38bd4..7d51085 100644
---- a/ps2xRuntime/src/lib/game_overrides.cpp
-+++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -6,7 +6,9 @@
- #include "ps2_log.h"
- #include <algorithm>
- #include <cctype>
-+#include <cstdlib>
- #include <filesystem>
-+#include <fstream>
- #include <iostream>
- #include <mutex>
- #include <optional>
-@@ -125,6 +127,27 @@ namespace ps2_game_overrides
-                        uint32_t fileCrc32,
-                        bool fileCrcValid)
-     {
-+        // PS2X_BINDS: text file, one "handler@0xADDR" per line ('#' starts a comment).
-+        // Rebinds without regenerating or rebuilding the recompiled game.
-+        // shortcut: applies to whichever ELF is loaded, no CRC check; fine while there is one game.
-+        if (const char *bindsPath = std::getenv("PS2X_BINDS"))
-+        {
-+            std::ifstream in(bindsPath);
-+            std::string line;
-+            while (std::getline(in, line))
-+            {
-+                line = line.substr(0, line.find('#'));
-+                line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
-+                const size_t at = line.rfind('@');
-+                if (at == std::string::npos)
-+                {
-+                    continue;
-+                }
-+                bindAddressHandler(runtime, static_cast<uint32_t>(std::strtoul(line.c_str() + at + 1, nullptr, 0)),
-+                                   std::string_view(line).substr(0, at));
-+            }
-+        }
-+
- 
-         std::vector<Descriptor> descriptors;
-         {
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 index f0ad507..e56ed81 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
@@ -2953,7 +2911,7 @@ index 45cb9d2..bcfdf25 100644
 +
 +namespace
 +{
-+    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fração da janela e ns por ciclo)
++    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fraÃ§Ã£o da janela e ns por ciclo)
 +    struct Vu1Prof
 +    {
 +        bool on = std::getenv("PS2X_PROF") != nullptr;
@@ -3357,10 +3315,10 @@ index bd75bba..95aacce 100644
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
 diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
-index ea86a9c..4d4752c 100644
+index ea86a9c..55fa018 100644
 --- a/ps2xRuntime/include/runtime/ps2_memory.h
 +++ b/ps2xRuntime/include/runtime/ps2_memory.h
-@@ -296,6 +296,19 @@ public:
+@@ -296,6 +296,20 @@ public:
      void write64(uint32_t address, uint64_t value);
      void write128(uint32_t address, __m128i value);
  
@@ -3374,13 +3332,14 @@ index ea86a9c..4d4752c 100644
 +    void ipuReset();
 +    void ipuWriteCmd(uint32_t value);
 +    void ipuFeed(const uint8_t *data, size_t size);
-+    uint32_t ipuReadCmdBits() const;
++    uint32_t ipuReadCmdBits();
 +    void ipuRunChannelDma(uint32_t channelBase, uint32_t chcr);
++    void ipuChainPump(size_t wantBytes);
 +
      // TLB handling
      uint32_t translateAddress(uint32_t virtualAddress);
      bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
-@@ -421,6 +434,10 @@ public:
+@@ -421,6 +435,18 @@ public:
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
      std::vector<PendingTransfer> m_pendingVif1Transfers;
@@ -3388,11 +3347,126 @@ index ea86a9c..4d4752c 100644
 +    std::vector<uint8_t> m_ipuIn; // bitstream bytes fed to the IPU input FIFO
 +    uint64_t m_ipuBitPos = 0u;    // absolute bit pointer into m_ipuIn (IPU_BP)
 +    uint32_t m_ipuCtrl = 0u;      // IPU_CTRL, BUSY (bit 31) never set
++
++    // The IPU input DMA runs at hardware pace: the bitstream buffer is filled by
++    // the CD stream, so chunks are pulled from guest RAM only when the parser
++    // actually needs them, not when the channel is programmed.
++    bool m_ipuChainActive = false;
++    uint32_t m_ipuChainTagAddr = 0u;
++    uint32_t m_ipuChainDataAddr = 0u;
++    uint32_t m_ipuChainRemainingQw = 0u;
      std::mutex m_completedDmacMutex;
      std::vector<uint32_t> m_completedDmacCauses;
  
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 1e38bd4..54b1297 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -4,9 +4,13 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_log.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <filesystem>
++#include <fstream>
+ #include <iostream>
+ #include <mutex>
+ #include <optional>
+@@ -58,6 +62,55 @@ namespace
+         return leaf.string();
+     }
+ 
++    // PS2X_DIAG_FORCE_MOVIE_DONE=<polls>: DIAGNOSTIC ONLY, off unless the variable
++    // is set. The attract movies never reach their teardown because the EE IPU
++    // block decode is not implemented, so the shell's exit gate never sees
++    // "movie finished". This override replaces the shell's pad-pressed test and,
++    // every <polls> calls, invokes the guest's own movie teardown routine (it does
++    // not poke the flag directly) so the game's own state machine can advance.
++    // It exists to measure the rest of the path (title screen, menu, input) while
++    // the movie decode is being worked on; it must not be on for normal play.
++    void diagForceMovieDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)rdram;
++        static uint32_t s_cadence = 0u;
++        static uint32_t s_polls = 0u;
++        static bool s_announced = false;
++        if (s_cadence == 0u)
++        {
++            const char *spec = std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE");
++            s_cadence = spec ? static_cast<uint32_t>(std::strtoul(spec, nullptr, 0)) : 0u;
++        }
++
++        if (s_cadence != 0u && runtime != nullptr)
++        {
++            if (!s_announced)
++            {
++                std::cerr << "[DIAG] PS2X_DIAG_FORCE_MOVIE_DONE=" << s_cadence
++                          << ": invoking the guest movie teardown every " << s_cadence
++                          << " pad polls. DIAGNOSTIC ONLY." << std::endl;
++                s_announced = true;
++            }
++
++            if ((++s_polls % s_cadence) == 0u)
++            {
++                // Set the movie player object's state to 3, which is the state its
++                // own per-frame pump maps to "stream finished". The pump then calls
++                // the real teardown (FUN_00224308) itself, so the game's own state
++                // machine performs the transition; nothing here writes the exposed
++                // "movie done" flag directly.
++                constexpr uint32_t kPlayerStateAddr = 0x663C00u; // 0x663B58 + 0xA8
++                if (rdram != nullptr)
++                {
++                    *reinterpret_cast<uint32_t *>(rdram + kPlayerStateAddr) = 3u;
++                    std::cerr << "[DIAG] set player state=3 (poll " << s_polls << ")" << std::endl;
++                }
++            }
++        }
++
++        setReturnS32(ctx, 0); // the shell's "is a pad button pressed" test
++    }
++
+     std::optional<PS2Runtime::RecompiledFunction> resolveHandlerByName(std::string_view handlerName)
+     {
+         const std::string_view resolvedSyscall = ps2_runtime_calls::resolveSyscallName(handlerName);
+@@ -125,6 +178,32 @@ namespace ps2_game_overrides
+                        uint32_t fileCrc32,
+                        bool fileCrcValid)
+     {
++        // PS2X_BINDS: text file, one "handler@0xADDR" per line ('#' starts a comment).
++        // Rebinds without regenerating or rebuilding the recompiled game.
++        // shortcut: applies to whichever ELF is loaded, no CRC check; fine while there is one game.
++        if (const char *bindsPath = std::getenv("PS2X_BINDS"))
++        {
++            std::ifstream in(bindsPath);
++            std::string line;
++            while (std::getline(in, line))
++            {
++                line = line.substr(0, line.find('#'));
++                line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
++                const size_t at = line.rfind('@');
++                if (at == std::string::npos)
++                {
++                    continue;
++                }
++                bindAddressHandler(runtime, static_cast<uint32_t>(std::strtoul(line.c_str() + at + 1, nullptr, 0)),
++                                   std::string_view(line).substr(0, at));
++            }
++        }
++
++        if (std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE") != nullptr)
++        {
++            runtime.replaceFunction(0x220618u, &diagForceMovieDone);
++        }
++
+ 
+         std::vector<Descriptor> descriptors;
+         {
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..a1785b9 100644
+index 37b6a4d..34a3302 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -790,6 +790,13 @@ uint64_t PS2Memory::read64(uint32_t address)
@@ -3428,7 +3502,7 @@ index 37b6a4d..a1785b9 100644
      if (isGsPrivReg(address))
      {
          uint32_t off = address & 7;
-@@ -1067,6 +1086,28 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+@@ -1067,6 +1086,30 @@ void PS2Memory::write128(uint32_t address, __m128i value)
          throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
      }
  
@@ -3448,16 +3522,18 @@ index 37b6a4d..a1785b9 100644
 +
 +    if (address == 0x10007010u) // IPU input FIFO
 +    {
-+        alignas(16) uint8_t fifoData[16];
-+        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
-+        ipuFeed(fifoData, sizeof(fifoData));
++        // The input FIFO carries SETIQ/SETVQ table data (quantiser and VQ tables),
++        // not the coded elementary stream: that arrives through the IPU input DMA
++        // channel and is pulled by ipuChainPump. Feeding these 128-bit table writes
++        // into the bitstream buffer would corrupt the stream, so they are ignored
++        // until the block decode (which consumes them) is implemented.
 +        return;
 +    }
 +
      const bool scratch = isScratchpad(address);
      uint32_t physAddr = translateAddress(address);
  
-@@ -1184,13 +1225,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1184,13 +1227,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
          if (address == 0x10002010)
          {
              m_ioRegisters[address] = value & ~(1u << 31);
@@ -3479,22 +3555,32 @@ index 37b6a4d..a1785b9 100644
          else
          {
              m_ioRegisters[address] = value;
-@@ -1311,6 +1360,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
-                 return true;
-             }
+@@ -1292,6 +1343,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
  
-+            if (channelBase == 0x1000B000u || channelBase == 0x1000B400u)
+     if (address >= 0x10008000 && address < 0x1000F000)
+     {
++        // IPU channels: the player programs a chain (TADR/MADR) and then writes a
++        // CHCR that selects a direction/mode but never sets STR. It expects the
++        // feed to run, so treat any such CHCR write as the kick.
++        {
++            const uint32_t ipuBase = address & 0xFFFFFF00u;
++            if ((ipuBase == 0x1000B000u || ipuBase == 0x1000B400u) && (address & 0xFFu) == 0x00u)
 +            {
-+                // IPU_FROM / IPU_TO: the MPEG player's bitstream input and decoded
-+                // picture output channels.
-+                ipuRunChannelDma(channelBase, value);
++                const auto ipuDctrlIt = m_ioRegisters.find(0x1000E000u);
++                const bool ipuDmacEnabled = (ipuDctrlIt == m_ioRegisters.end()) || ((ipuDctrlIt->second & 0x1u) != 0u);
++                if (ipuDmacEnabled && (((value & 0x3u) != 0u) || ((value & 0x100u) != 0u)))
++                {
++                    ipuRunChannelDma(ipuBase, value);
++                }
++                m_ioRegisters[address] = value & ~0x100u;
 +                return true;
 +            }
++        }
 +
-             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
-             {
-                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
-@@ -1584,6 +1641,242 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         if ((address & 0xFF) == 0x00 && (value & 0x100))
+         {
+             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
+@@ -1584,6 +1653,321 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
      return false;
  }
  
@@ -3577,10 +3663,13 @@ index 37b6a4d..a1785b9 100644
 +    }
 +}
 +
-+uint32_t PS2Memory::ipuReadCmdBits() const
++uint32_t PS2Memory::ipuReadCmdBits()
 +{
++    ipuChainPump(8u);
++
 +    static uint32_t s_readTrace = 0u;
-+    if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_readTrace < 48u)
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_readTrace < 400u &&
++        (s_readTrace < 8u || m_ipuBitPos < (static_cast<uint64_t>(m_ipuIn.size()) * 8u)))
 +    {
 +        const uint64_t bytePos = m_ipuBitPos >> 3u;
 +        const uint32_t bitOff = static_cast<uint32_t>(m_ipuBitPos & 7u);
@@ -3593,6 +3682,7 @@ index 37b6a4d..a1785b9 100644
 +        const uint32_t bits = static_cast<uint32_t>((window >> (32u - bitOff)) & 0xFFFFFFFFu);
 +        std::cerr << "[ipu:rd]  #" << s_readTrace << " bits=0x" << std::hex << bits << std::dec
 +                  << " bitPos=" << m_ipuBitPos << " buffered=" << m_ipuIn.size()
++                  << " chain=" << (m_ipuChainActive ? 1 : 0)
 +                  << " starved=" << (bytePos + 8u > m_ipuIn.size() ? 1 : 0) << std::endl;
 +        ++s_readTrace;
 +    }
@@ -3622,6 +3712,7 @@ index 37b6a4d..a1785b9 100644
 +        std::cerr << "[ipu:dma] #" << s_dmaTrace << " ch=0x" << std::hex << channelBase << std::dec
 +                  << " chcr=0x" << std::hex << chcr << std::dec
 +                  << " mode=" << mode << " madr=0x" << std::hex << madr << std::dec
++                  << " tadr=0x" << std::hex << m_ioRegisters[channelBase + 0x30u] << std::dec
 +                  << " qwc=" << qwc << std::endl;
 +        ++s_dmaTrace;
 +    }
@@ -3660,67 +3751,13 @@ index 37b6a4d..a1785b9 100644
 +    {
 +        if (mode == 1u)
 +        {
-+            uint32_t tagAddr = m_ioRegisters[channelBase + 0x30u];
-+            for (int tags = 0; tags < 4096; ++tags)
-+            {
-+                const bool tagInSpr = isScratchpad(tagAddr);
-+                uint32_t physTag = 0u;
-+                try
-+                {
-+                    physTag = translateAddress(tagAddr);
-+                }
-+                catch (const std::exception &)
-+                {
-+                    break;
-+                }
-+                const uint8_t *tagBase = tagInSpr ? m_scratchpad : m_rdram;
-+                const uint32_t tagMax = tagInSpr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-+                if (physTag + 16u > tagMax)
-+                    break;
-+
-+                uint64_t tag = 0u;
-+                std::memcpy(&tag, tagBase + physTag, sizeof(tag));
-+                const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
-+                const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
-+                const uint32_t addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
-+
-+                uint32_t dataAddr = 0u;
-+                bool endChain = false;
-+                switch (id)
-+                {
-+                case 0u:
-+                    dataAddr = addr;
-+                    tagAddr += 16u;
-+                    endChain = true;
-+                    break;
-+                case 1u:
-+                    dataAddr = tagAddr + 16u;
-+                    tagAddr = dataAddr + tagQwc * 16u;
-+                    break;
-+                case 2u:
-+                    dataAddr = tagAddr + 16u;
-+                    tagAddr = addr;
-+                    break;
-+                case 3u:
-+                case 4u:
-+                    dataAddr = addr;
-+                    tagAddr += 16u;
-+                    break;
-+                case 7u:
-+                    dataAddr = tagAddr + 16u;
-+                    endChain = true;
-+                    break;
-+                default:
-+                    endChain = true;
-+                    break;
-+                }
-+
-+                if (tagQwc > 0u)
-+                    appendGuest(dataAddr, tagQwc);
-+                if (endChain)
-+                    break;
-+            }
-+            m_ioRegisters[channelBase + 0x30u] = tagAddr;
++            // Chain mode: remember where the chain starts and let ipuChainPump pull
++            // chunks on demand. The stream buffer is filled by the CD stream while
++            // the parser runs, so copying at kick time reads it before it arrives.
++            m_ipuChainActive = true;
++            m_ipuChainTagAddr = m_ioRegisters[channelBase + 0x30u];
++            m_ipuChainDataAddr = 0u;
++            m_ipuChainRemainingQw = 0u;
 +        }
 +        else if (mode == 0u && qwc > 0u)
 +        {
@@ -3734,10 +3771,138 @@ index 37b6a4d..a1785b9 100644
 +    m_ioRegisters[channelBase + 0x00u] = chcr & ~0x100u; // clear start/busy
 +}
 +
++// Pull the next bitstream chunk(s) from the IPU input chain when the parser needs
++// them. Runs against current guest RAM, so it picks up data the CD stream has
++// delivered in the meantime; a chunk that is still all-zero is treated as "not
++// delivered yet" and retried later (hardware would stall at that point).
++void PS2Memory::ipuChainPump(size_t wantBytes)
++{
++    if (!m_ipuChainActive)
++        return;
++
++    size_t guard = 0u;
++    while ((static_cast<size_t>(m_ipuBitPos >> 3u) + wantBytes > m_ipuIn.size()) && (guard++ < 64u))
++    {
++        if (m_ipuChainRemainingQw == 0u)
++        {
++            uint32_t physTag = 0u;
++            try
++            {
++                physTag = translateAddress(m_ipuChainTagAddr);
++            }
++            catch (const std::exception &)
++            {
++                m_ipuChainActive = false;
++                return;
++            }
++            if (physTag + 16u > PS2_RAM_SIZE)
++            {
++                m_ipuChainActive = false;
++                return;
++            }
++
++            uint64_t tag = 0u;
++            std::memcpy(&tag, m_rdram + physTag, sizeof(tag));
++            const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
++            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
++            const uint32_t addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
++            const uint32_t tagAddr = m_ipuChainTagAddr;
++
++            switch (id)
++            {
++            case 1u: // cnt: data follows the tag, next tag follows the data
++                m_ipuChainDataAddr = tagAddr + 16u;
++                m_ipuChainTagAddr = m_ipuChainDataAddr + qwc * 16u;
++                break;
++            case 2u: // next: data follows the tag, next tag at addr
++                m_ipuChainDataAddr = tagAddr + 16u;
++                m_ipuChainTagAddr = addr;
++                break;
++            case 3u: // ref: data at addr, next tag follows this one
++            case 4u: // refe
++                m_ipuChainDataAddr = addr;
++                m_ipuChainTagAddr = tagAddr + 16u;
++                break;
++            default: // 0 = end, 7 = end; nothing left to feed
++                m_ipuChainActive = false;
++                return;
++            }
++
++            if (qwc == 0u)
++                continue;
++
++            uint32_t physData = 0u;
++            try
++            {
++                physData = translateAddress(m_ipuChainDataAddr);
++            }
++            catch (const std::exception &)
++            {
++                m_ipuChainActive = false;
++                return;
++            }
++            if (physData + 32u > PS2_RAM_SIZE)
++            {
++                m_ipuChainActive = false;
++                return;
++            }
++            bool delivered = false;
++            for (uint32_t i = 0u; i < 32u; ++i)
++            {
++                if (m_rdram[physData + i] != 0u)
++                {
++                    delivered = true;
++                    break;
++                }
++            }
++            if (!delivered)
++                return;
++
++            m_ipuChainRemainingQw = qwc;
++        }
++
++        const uint32_t bytes = m_ipuChainRemainingQw * 16u;
++        uint32_t phys = 0u;
++        try
++        {
++            phys = translateAddress(m_ipuChainDataAddr);
++        }
++        catch (const std::exception &)
++        {
++            m_ipuChainActive = false;
++            return;
++        }
++        uint32_t left = bytes;
++        uint32_t p = phys;
++        while (left > 0u)
++        {
++            if (p >= PS2_RAM_SIZE)
++                p = 0u;
++            uint32_t chunk = left;
++            if (p + chunk > PS2_RAM_SIZE)
++                chunk = PS2_RAM_SIZE - p;
++            if (chunk == 0u)
++                break;
++            ipuFeed(m_rdram + p, chunk);
++            p += chunk;
++            left -= chunk;
++        }
++        m_ipuChainDataAddr += bytes;
++        m_ipuChainRemainingQw = 0u;
++
++        static uint32_t s_pumpTrace = 0u;
++        if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_pumpTrace < 6u)
++        {
++            std::cerr << "  [ipu:pump] +" << bytes << " total=" << m_ipuIn.size() << std::endl;
++            ++s_pumpTrace;
++        }
++    }
++}
++
  bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
  {
      static constexpr uint32_t kSprFromChannel = 0x1000D000u;
-@@ -2319,24 +2612,19 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+@@ -2319,24 +2703,19 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
  
      if (address >= 0x10002000 && address <= 0x10002030)
      {
