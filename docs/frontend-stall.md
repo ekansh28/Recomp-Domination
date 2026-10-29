@@ -43,9 +43,34 @@ produces.
 - So whatever is supposed to fill the object that `FUN_0021AE70` serves from is
   not running, or is running against a different address.
 
+## What the header fields mean
+
+Four separate readers agree on the shape of the object:
+
+```
+first descriptor = object + ([object+4] << 4)
+```
+
+`+0` is a count — the routine clears it on entry and increments it per built
+entry. `+4` is therefore the **header size in 16-byte units**: for a 16-byte
+header the value that makes the walk land past the header is `1`. Descriptors
+are 16 bytes and self-describing (first dword = size in bytes), and the walk
+`p += ([p] >> 2) << 4` stops on `[p] == 0`.
+
+That is why `+4` at zero hurts: the walk starts on the header itself, where a
+stray `1` gives a stride of zero.
+
+## A dead end, recorded
+
+The function on the registration path that looked like the populator is not one:
+it only writes its own stack frame and calls the logger that formats
+`loading file (%s) in memory %p - %p`. It builds a log message; it does not fill
+the object.
+
 ## Next step
 
 Find `FUN_0021AE70`'s data source and what feeds it — that is the producer that
-never runs. Instrument the read that returns `-1` (its comparison against the
-sentinel) rather than the loop, and trace which structure it consults and who
-was supposed to write it.
+never runs — and the code that should write the header's `+4` before the
+consumer pass runs. Instrument the read that returns `-1` (its comparison
+against the sentinel) rather than the loop, and trace which structure it
+consults and who was supposed to write it.
