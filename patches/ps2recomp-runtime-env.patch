@@ -1640,6 +1640,29 @@ index 039da2f..318bd7f 100644
  #endif
      }
  }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/FileIO.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/FileIO.cpp
+index ccfca5e..8b85d82 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/FileIO.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/FileIO.cpp
+@@ -38,6 +38,18 @@ namespace ps2_syscalls
+         }
+ 
+         const int32_t descriptor = runtime->vfs().open(ps2Path, static_cast<uint32_t>(flags), currentVfsMounts(), runtime->romDevice());
++
++        // PS2X_TRACE_FILES=1: bounded log of guest file opens, so the asset the game
++        // actually requests (and whether it resolves) is visible.
++        static uint32_t s_openTrace = 0u;
++        static const bool s_traceFileOpens = std::getenv("PS2X_TRACE_FILES") != nullptr;
++        if (s_traceFileOpens && s_openTrace++ < 96u)
++        {
++            std::cerr << "[guest-file] open \"" << ps2Path << "\" flags=0x"
++                      << std::hex << static_cast<uint32_t>(flags) << std::dec
++                      << " fd=" << descriptor << std::endl;
++        }
++
+         setReturnS32(ctx, descriptor);
+     }
+ 
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
 index 2c98016..e491663 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
