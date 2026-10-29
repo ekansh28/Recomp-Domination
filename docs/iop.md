@@ -43,16 +43,30 @@ run is unaffected.
 
 The module entry points do run — the emulator calls each module's entry after
 loading, and `cdvdman` reaches its own init far enough to print `cdvdman Init`
-through the IOP printf hook. But **no module registers an RPC server**, so
-`hasRpcServer(sid)` stays false for every SID and nothing can take over from the
-HLE. Two things stand in the way, in order:
+through the IOP printf hook. Their imports all resolve as well; a run produces
+no `[IOP] unhandled import` warning.
+
+**`cdvdman` is what regresses the loader.** Loading the rest of the stack
+(loadcore, sifcmd, sifman, threadman, ioman, modload, fileio, loadfile,
+timemani, romdrv, eesync, sysclib, stdio — everything except `cdvdman` and
+`cdvdfsv`) leaves the boot loader completing and the HLE CD path serving reads
+exactly as before. `cdvdman` is the module that takes the CD SIDs away from the
+HLE, and it does not drive the CD path well enough to finish booting.
+
+**No module registers an RPC server**, so `hasRpcServer(sid)` stays false for
+every SID and nothing can take over from the HLE. The modules run, their
+imports resolve, and `sifman`'s `sceSifRegisterRpc` is implemented in the
+emulator — but no module ends up reaching it, so the registration itself is
+where to look next (most likely each module registers from its own thread, and
+module-created threads are not being driven).
+
+Two further faults to fix on this track:
 
 1. The IOP faults during the first module's start with
    `[IOP] execution outside RAM pc=0x200000`; whatever the runtime initialises
    the IOP with is not enough for `loadcore` to complete cleanly.
-2. Services register through `sceSifRegisterRpc` from a thread the module
-   creates — that needs the module's `threadman`/`sifman` peers to be running,
-   which in turn depends on (1).
+2. `ioman` reports `Unknown device '%s'` / `Known devices are`, so the device
+   table a module registers is not reaching it.
 
 `IopSubsystem::canBindRpc` logs `[IOP] emulated RPC server for sid=...`
 whenever a loaded module does own a SID, so this is measurable rather than
