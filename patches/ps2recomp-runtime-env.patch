@@ -3020,7 +3020,7 @@ index a8f9fa8..47ccc1c 100644
      {
          PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);
 diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
-index 8d46e03..41605c7 100644
+index 8d46e03..a92a1c9 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
 +++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
 @@ -194,6 +194,12 @@ bool PS2IopHostAdapter::normalizeGuestAddress(uint32_t address, uint32_t &normal
@@ -3036,7 +3036,42 @@ index 8d46e03..41605c7 100644
  bool PS2IopHostAdapter::readIopMemory(uint32_t address, void *destination, size_t size) const
  {
      return m_runtime.readIopMemory(address, destination, size);
-@@ -463,14 +469,11 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
+@@ -303,6 +309,12 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+         return 0u;
+     }
+ 
++    // PS2X_TRACE_FILES=1: bounded log of host file opens, to see which disc assets
++    // the guest actually requests. Off unless the variable is set.
++    static uint32_t s_fileOpenTrace = 0u;
++    static const bool s_traceFiles = std::getenv("PS2X_TRACE_FILES") != nullptr;
++    const bool traceThisOpen = s_traceFiles && (s_fileOpenTrace++ < 96u);
++
+     const std::filesystem::path hostPath{std::string(path)};
+ #if defined(_WIN32)
+     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
+@@ -311,6 +323,8 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+ #endif
+     if (!stream)
+     {
++        if (traceThisOpen)
++            std::cerr << "[file] open FAILED " << path << std::endl;
+         return 0u;
+     }
+ 
+@@ -319,8 +333,12 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
+     if (error)
+     {
+         std::fclose(stream);
++        if (traceThisOpen)
++            std::cerr << "[file] open FAILED(size) " << path << std::endl;
+         return 0u;
+     }
++    if (traceThisOpen)
++        std::cerr << "[file] open " << path << " size=" << size << std::endl;
+ 
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     uint64_t handle = m_nextHostFileHandle++;
+@@ -463,14 +481,11 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
      }
  
      R5900Context context{};
