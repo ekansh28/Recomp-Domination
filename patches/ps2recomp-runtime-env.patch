@@ -2953,7 +2953,7 @@ index 45cb9d2..bcfdf25 100644
 +
 +namespace
 +{
-+    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fração da janela e ns por ciclo)
++    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fraÃ§Ã£o da janela e ns por ciclo)
 +    struct Vu1Prof
 +    {
 +        bool on = std::getenv("PS2X_PROF") != nullptr;
@@ -3356,3 +3356,418 @@ index bd75bba..95aacce 100644
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..4d4752c 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -296,6 +296,19 @@ public:
+     void write64(uint32_t address, uint64_t value);
+     void write128(uint32_t address, __m128i value);
+ 
++    // ---- EE IPU (image processing unit) --------------------------------------
++    // The IPU is a hardware MPEG1/MPEG2 decoder. What is modelled here is the
++    // bitstream interface the game's own MPEG player drives: the IPU_FROM DMA
++    // channel feeds the input FIFO, IPU_CMD carries the "fetch N bits" command
++    // and reading it back returns the 32 bits at the bit pointer IPU_BP, which
++    // the command then advances. The macroblock decode (IDCT) is not implemented
++    // yet, so no decoded picture is produced, but the elementary stream parses.
++    void ipuReset();
++    void ipuWriteCmd(uint32_t value);
++    void ipuFeed(const uint8_t *data, size_t size);
++    uint32_t ipuReadCmdBits() const;
++    void ipuRunChannelDma(uint32_t channelBase, uint32_t chcr);
++
+     // TLB handling
+     uint32_t translateAddress(uint32_t virtualAddress);
+     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
+@@ -421,6 +434,10 @@ public:
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
++
++    std::vector<uint8_t> m_ipuIn; // bitstream bytes fed to the IPU input FIFO
++    uint64_t m_ipuBitPos = 0u;    // absolute bit pointer into m_ipuIn (IPU_BP)
++    uint32_t m_ipuCtrl = 0u;      // IPU_CTRL, BUSY (bit 31) never set
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..a1785b9 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -790,6 +790,13 @@ uint64_t PS2Memory::read64(uint32_t address)
+         throw std::runtime_error("Unaligned 64-bit read at address: 0x" + std::to_string(address));
+     }
+ 
++    if (address >= 0x10002000 && address <= 0x10002030)
++    {
++        // 64-bit IPU reads: bit 63 is BUSY; it is kept clear so the guest's
++        // "wait until not busy" loops (e.g. after writing a command) terminate.
++        return static_cast<uint64_t>(read32(address));
++    }
++
+     if (isGsPrivReg(address))
+     {
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+@@ -951,6 +958,18 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+         throw std::runtime_error("Unaligned 32-bit write at address: 0x" + std::to_string(address));
+     }
+ 
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr &&
++        ((address >= 0x1000B000u && address <= 0x1000B050u) ||
++         (address >= 0x1000B400u && address <= 0x1000B450u)))
++    {
++        static uint32_t s_wrTrace = 0u;
++        if (s_wrTrace < 160u)
++        {
++            std::cerr << "[ipu:dmach] 0x" << std::hex << address << " = 0x" << value << std::dec << std::endl;
++            ++s_wrTrace;
++        }
++    }
++
+     if (isGsPrivReg(address))
+     {
+         uint32_t off = address & 7;
+@@ -1067,6 +1086,28 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
+     }
+ 
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr &&
++        ((address >= 0x10002000u && address <= 0x10002030u) ||
++         (address >= 0x10007000u && address <= 0x10007020u) ||
++         (address >= 0x1000B000u && address <= 0x1000B050u) ||
++         (address >= 0x1000B400u && address <= 0x1000B450u)))
++    {
++        static uint32_t s_wrTrace128 = 0u;
++        if (s_wrTrace128 < 64u)
++        {
++            std::cerr << "[ipu:wr128] 0x" << std::hex << address << std::dec << std::endl;
++            ++s_wrTrace128;
++        }
++    }
++
++    if (address == 0x10007010u) // IPU input FIFO
++    {
++        alignas(16) uint8_t fifoData[16];
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
++        ipuFeed(fifoData, sizeof(fifoData));
++        return;
++    }
++
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+ 
+@@ -1184,13 +1225,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         if (address == 0x10002010)
+         {
+             m_ioRegisters[address] = value & ~(1u << 31);
++            m_ipuCtrl = m_ioRegisters[address];
+             if (value & (1u << 30))
+             {
+                 m_ioRegisters[0x10002000] = 0;
+                 m_ioRegisters[0x10002020] = 0;
+                 m_ioRegisters[0x10002030] = 0;
++                m_ipuIn.clear();
++                m_ipuBitPos = 0u;
+             }
+         }
++        else if (address == 0x10002000u)
++        {
++            m_ioRegisters[address] = value;
++            ipuWriteCmd(value);
++        }
+         else
+         {
+             m_ioRegisters[address] = value;
+@@ -1311,6 +1360,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
++            if (channelBase == 0x1000B000u || channelBase == 0x1000B400u)
++            {
++                // IPU_FROM / IPU_TO: the MPEG player's bitstream input and decoded
++                // picture output channels.
++                ipuRunChannelDma(channelBase, value);
++                return true;
++            }
++
+             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1584,6 +1641,242 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     return false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// EE IPU bitstream interface.
++//
++// MPEG1/MPEG2 on the PS2 is decoded by the EE's Image Processing Unit. The game
++// ships its own MPEG player, which drives the IPU directly: the IPU_FROM DMA
++// channel fills the IPU input FIFO with elementary-stream bytes, and the parser
++// reads syntax bits with the "fetch N bits" command - write IPU_CMD = N |
++// 0x40000000 (FDEC) and read IPU_CMD back, which returns the 32 bits at the bit
++// pointer IPU_BP; FDEC advances that pointer by N. Command 0 (BCLR) clears the
++// input FIFO and sets the pointer. (PCSX2's IPU.cpp is the reference:
++// ipuRead32(IPU_CMD) -> getBits32 + BigEndian, IPUCMD_WRITE -> g_BP.Advance.)
++//
++// Only the bitstream side is modelled: IDEC/BDEC (the IDCT that actually
++// produces macroblocks) are not implemented, so no picture is produced yet, but
++// the elementary stream parses and completes.
++void PS2Memory::ipuReset()
++{
++    m_ipuIn.clear();
++    m_ipuBitPos = 0u;
++    m_ipuCtrl = 0u;
++}
++
++void PS2Memory::ipuFeed(const uint8_t *data, size_t size)
++{
++    if (!data || size == 0u)
++        return;
++    m_ipuIn.insert(m_ipuIn.end(), data, data + size);
++}
++
++void PS2Memory::ipuWriteCmd(uint32_t value)
++{
++    const uint32_t cmd = (value >> 28u) & 0xFu;
++    const uint32_t arg = value & 0x0FFFFFFFu;
++
++    static uint32_t s_cmdTrace = 0u;
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_cmdTrace < 48u)
++    {
++        std::cerr << "[ipu:cmd] #" << s_cmdTrace << " val=0x" << std::hex << value << std::dec
++                  << " cmd=" << cmd << " arg=" << arg
++                  << " bitPos=" << m_ipuBitPos << " buffered=" << m_ipuIn.size() << std::endl;
++        ++s_cmdTrace;
++    }
++
++    switch (cmd)
++    {
++    case 0x0u: // BCLR: clear the input FIFO, set the bit pointer
++        m_ipuIn.clear();
++        m_ipuBitPos = arg & 0x7Fu;
++        break;
++    case 0x1u: // IDEC
++    case 0x2u: // BDEC
++    case 0x3u: // VDEC
++    case 0x4u: // FDEC (the parser's "fetch bits")
++    case 0x5u: // SETIQ
++    case 0x6u: // SETVQ
++        m_ipuBitPos += (arg & 0x3Fu);
++        break;
++    default: // SETTH / CSC / PACK carry no bit stream
++        break;
++    }
++
++    // The hardware stalls when the input FIFO runs dry: the bit pointer cannot
++    // move past the data actually held. Without this clamp a guest that polls
++    // for bits it never receives (movie data not fed yet) would advance the
++    // pointer without bound and the trim below would erase past the end.
++    const uint64_t availableBits = static_cast<uint64_t>(m_ipuIn.size()) * 8u;
++    if (m_ipuBitPos > availableBits)
++        m_ipuBitPos = availableBits;
++
++    // Forget bytes the pointer has consumed so a long movie cannot grow the
++    // buffer without bound.
++    const uint64_t consumedBytes = m_ipuBitPos >> 3u;
++    if (consumedBytes > 0x10000u)
++    {
++        m_ipuIn.erase(m_ipuIn.begin(), m_ipuIn.begin() + static_cast<std::ptrdiff_t>(consumedBytes));
++        m_ipuBitPos -= consumedBytes << 3u;
++    }
++}
++
++uint32_t PS2Memory::ipuReadCmdBits() const
++{
++    static uint32_t s_readTrace = 0u;
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_readTrace < 48u)
++    {
++        const uint64_t bytePos = m_ipuBitPos >> 3u;
++        const uint32_t bitOff = static_cast<uint32_t>(m_ipuBitPos & 7u);
++        uint64_t window = 0u;
++        for (uint32_t i = 0u; i < 8u; ++i)
++        {
++            const uint64_t idx = bytePos + i;
++            window = (window << 8u) | (idx < m_ipuIn.size() ? m_ipuIn[static_cast<size_t>(idx)] : 0u);
++        }
++        const uint32_t bits = static_cast<uint32_t>((window >> (32u - bitOff)) & 0xFFFFFFFFu);
++        std::cerr << "[ipu:rd]  #" << s_readTrace << " bits=0x" << std::hex << bits << std::dec
++                  << " bitPos=" << m_ipuBitPos << " buffered=" << m_ipuIn.size()
++                  << " starved=" << (bytePos + 8u > m_ipuIn.size() ? 1 : 0) << std::endl;
++        ++s_readTrace;
++    }
++
++    // The 32 bits at the bit pointer, big-endian.
++    const uint64_t bytePos = m_ipuBitPos >> 3u;
++    const uint32_t bitOff = static_cast<uint32_t>(m_ipuBitPos & 7u);
++    uint64_t window = 0u;
++    for (uint32_t i = 0u; i < 8u; ++i)
++    {
++        const uint64_t idx = bytePos + i;
++        const uint8_t byte = idx < m_ipuIn.size() ? m_ipuIn[static_cast<size_t>(idx)] : 0u;
++        window = (window << 8u) | byte;
++    }
++    return static_cast<uint32_t>((window >> (32u - bitOff)) & 0xFFFFFFFFu);
++}
++
++void PS2Memory::ipuRunChannelDma(uint32_t channelBase, uint32_t chcr)
++{
++    const uint32_t mode = (chcr >> 2u) & 0x3u;
++    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
++    const uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
++
++    static uint32_t s_dmaTrace = 0u;
++    if (std::getenv("PS2X_TRACE_IPU") != nullptr && s_dmaTrace < 32u)
++    {
++        std::cerr << "[ipu:dma] #" << s_dmaTrace << " ch=0x" << std::hex << channelBase << std::dec
++                  << " chcr=0x" << std::hex << chcr << std::dec
++                  << " mode=" << mode << " madr=0x" << std::hex << madr << std::dec
++                  << " qwc=" << qwc << std::endl;
++        ++s_dmaTrace;
++    }
++
++    auto appendGuest = [this](uint32_t addr, uint32_t qwCount)
++    {
++        uint32_t bytes = qwCount * 16u;
++        uint32_t phys = 0u;
++        try
++        {
++            phys = translateAddress(addr);
++        }
++        catch (const std::exception &)
++        {
++            return;
++        }
++        while (bytes > 0u)
++        {
++            if (phys >= PS2_RAM_SIZE)
++                phys = 0u;
++            uint32_t chunk = bytes;
++            if (phys + chunk > PS2_RAM_SIZE)
++                chunk = PS2_RAM_SIZE - phys;
++            if (chunk == 0u)
++                break;
++            ipuFeed(m_rdram + phys, chunk);
++            bytes -= chunk;
++            phys += chunk;
++        }
++    };
++
++    // Directions: DMA4 "IPU_TO" (0x1000B400) carries data *to* the IPU, i.e. the
++    // elementary stream that fills the bitstream FIFO; DMA3 "IPU_FROM"
++    // (0x1000B000) carries decoded macroblocks back out.
++    if (channelBase == 0x1000B400u) // bitstream input
++    {
++        if (mode == 1u)
++        {
++            uint32_t tagAddr = m_ioRegisters[channelBase + 0x30u];
++            for (int tags = 0; tags < 4096; ++tags)
++            {
++                const bool tagInSpr = isScratchpad(tagAddr);
++                uint32_t physTag = 0u;
++                try
++                {
++                    physTag = translateAddress(tagAddr);
++                }
++                catch (const std::exception &)
++                {
++                    break;
++                }
++                const uint8_t *tagBase = tagInSpr ? m_scratchpad : m_rdram;
++                const uint32_t tagMax = tagInSpr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++                if (physTag + 16u > tagMax)
++                    break;
++
++                uint64_t tag = 0u;
++                std::memcpy(&tag, tagBase + physTag, sizeof(tag));
++                const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
++                const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
++                const uint32_t addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
++
++                uint32_t dataAddr = 0u;
++                bool endChain = false;
++                switch (id)
++                {
++                case 0u:
++                    dataAddr = addr;
++                    tagAddr += 16u;
++                    endChain = true;
++                    break;
++                case 1u:
++                    dataAddr = tagAddr + 16u;
++                    tagAddr = dataAddr + tagQwc * 16u;
++                    break;
++                case 2u:
++                    dataAddr = tagAddr + 16u;
++                    tagAddr = addr;
++                    break;
++                case 3u:
++                case 4u:
++                    dataAddr = addr;
++                    tagAddr += 16u;
++                    break;
++                case 7u:
++                    dataAddr = tagAddr + 16u;
++                    endChain = true;
++                    break;
++                default:
++                    endChain = true;
++                    break;
++                }
++
++                if (tagQwc > 0u)
++                    appendGuest(dataAddr, tagQwc);
++                if (endChain)
++                    break;
++            }
++            m_ioRegisters[channelBase + 0x30u] = tagAddr;
++        }
++        else if (mode == 0u && qwc > 0u)
++        {
++            appendGuest(madr, qwc);
++        }
++    }
++    // DMA3 (0x1000B000) drains decoded data; nothing is produced yet, so the
++    // transfer simply completes.
++
++    m_ioRegisters[channelBase + 0x20u] = 0u;            // QWC drained
++    m_ioRegisters[channelBase + 0x00u] = chcr & ~0x100u; // clear start/busy
++}
++
+ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+ {
+     static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+@@ -2319,24 +2612,19 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+ 
+     if (address >= 0x10002000 && address <= 0x10002030)
+     {
+-        uint32_t val = 0;
+         switch (address)
+         {
+-        case 0x10002000:
+-            val = m_ioRegisters[address];
+-            break;
+-        case 0x10002010:
+-            val = m_ioRegisters[address] & ~(1u << 31);
+-            break;
+-        case 0x10002020:
+-        case 0x10002030:
+-            val = m_ioRegisters[address];
+-            break;
++        case 0x10002000: // IPU_CMD: the 32 bitstream bits at the bit pointer
++            return ipuReadCmdBits();
++        case 0x10002010: // IPU_CTRL: BUSY (bit 31) is never reported
++            return m_ipuCtrl & ~(1u << 31);
++        case 0x10002020: // IPU_BP: bit pointer (low 3 bits = bit offset in byte)
++            return static_cast<uint32_t>(m_ipuBitPos & 0x7Fu);
++        case 0x10002030: // IPU_TOP: a full word is available above the pointer
++            return 0u;
+         default:
+-            val = 0;
+-            break;
++            return 0u;
+         }
+-        return val;
+     }
+ 
+     if (address == 0x10003020u) // GIF_STAT

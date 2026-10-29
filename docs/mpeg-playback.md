@@ -129,6 +129,35 @@ tree.
 while adding hardware emulation with no user-visible effect; removing the diagnostic
 binding alone is a regression. Both of those were therefore not shipped.
 
+## Progress: an IPU bitstream model is now in the runtime
+
+`ps2_memory.{h,cpp}` now models the IPU interface the player uses, exported to
+`patches/ps2recomp-runtime-env.patch`:
+
+* `IPU_CMD` writes are decoded (`BCLR` clears the input FIFO and sets the bit pointer,
+  `FDEC`/`VDEC`/`IDEC`/`BDEC`/`SETIQ`/`SETVQ` advance it), `IPU_CMD` reads return the
+  32 bitstream bits at `IPU_BP` big-endian, and `IPU_CTRL`/`IPU_BP`/`IPU_TOP` report
+  non-busy/pointer state so the guest's polling loops terminate.
+* The IPU input FIFO (`0x10007010`) and the IPU DMA channels are serviced: DMA4
+  (`IPU_TO`, memory to IPU) feeds the bitstream, DMA3 (`IPU_FROM`) drains decoded
+  data. Both complete immediately (QWC cleared, start bit cleared).
+* `PS2X_TRACE_IPU=1` prints the first IPU commands, bit reads and DMA writes.
+
+**A live trace shows the feed is still missing.** With the real parser enabled
+(`ret0@0x251A10` removed), the guest issues `BCLR`, loads the IQ/VQ tables through
+`IPU_IN_FIFO`, `BCLR`s again, and then loops `FDEC` forever reading zeros: no IPU DMA
+channel is ever *started* (the guest only writes CHCR values `0x0/0x1/0x5`, never with
+the `STR` bit `0x100`), and the only `IPU_IN_FIFO` writes are the 160 bytes of
+quantiser/VQ tables. So the elementary stream does not reach the IPU in this boot path
+yet, and the earlier livelock is unchanged. Identifying what is supposed to fill the
+input FIFO (a DMA start the runtime swallows, or a request-driven refill callback) is
+the next step.
+
+Also fixed here: the input-buffer trim could erase past the end when the bit pointer
+advanced over data that had not arrived, which tripped a checked-iterator assertion in
+a debug build (`cannot seek vector iterator after end`). The pointer is now clamped to
+the data actually held, matching the hardware stall.
+
 ## Next highest-value experiment
 
 Decide between A and B by measuring how far a *demux-only* fix gets: add the IPU
