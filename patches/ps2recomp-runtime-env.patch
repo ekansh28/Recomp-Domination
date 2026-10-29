@@ -1129,6 +1129,50 @@ index c784ff7..942cbe8 100644
  	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
  	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
  
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..55fa018 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -296,6 +296,20 @@ public:
+     void write64(uint32_t address, uint64_t value);
+     void write128(uint32_t address, __m128i value);
+ 
++    // ---- EE IPU (image processing unit) --------------------------------------
++    // The IPU is a hardware MPEG1/MPEG2 decoder. What is modelled here is the
++    // bitstream interface the game's own MPEG player drives: the IPU_FROM DMA
++    // channel feeds the input FIFO, IPU_CMD carries the "fetch N bits" command
++    // and reading it back returns the 32 bits at the bit pointer IPU_BP, which
++    // the command then advances. The macroblock decode (IDCT) is not implemented
++    // yet, so no decoded picture is produced, but the elementary stream parses.
++    void ipuReset();
++    void ipuWriteCmd(uint32_t value);
++    void ipuFeed(const uint8_t *data, size_t size);
++    uint32_t ipuReadCmdBits();
++    void ipuRunChannelDma(uint32_t channelBase, uint32_t chcr);
++    void ipuChainPump(size_t wantBytes);
++
+     // TLB handling
+     uint32_t translateAddress(uint32_t virtualAddress);
+     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
+@@ -421,6 +435,18 @@ public:
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
++
++    std::vector<uint8_t> m_ipuIn; // bitstream bytes fed to the IPU input FIFO
++    uint64_t m_ipuBitPos = 0u;    // absolute bit pointer into m_ipuIn (IPU_BP)
++    uint32_t m_ipuCtrl = 0u;      // IPU_CTRL, BUSY (bit 31) never set
++
++    // The IPU input DMA runs at hardware pace: the bitstream buffer is filled by
++    // the CD stream, so chunks are pulled from guest RAM only when the parser
++    // actually needs them, not when the channel is programmed.
++    bool m_ipuChainActive = false;
++    uint32_t m_ipuChainTagAddr = 0u;
++    uint32_t m_ipuChainDataAddr = 0u;
++    uint32_t m_ipuChainRemainingQw = 0u;
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
+ 
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
 index 67c8184..bcda1c1 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
@@ -2377,6 +2421,113 @@ index 5110ee2..cca003e 100644
          releaseWaitImpl(rdram, ctx, runtime, true);
      }
  }
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 1e38bd4..54b1297 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -4,9 +4,13 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_log.h"
++#include "ps2_runtime_macros.h"
++#include "runtime/ee_scheduler.h"
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <filesystem>
++#include <fstream>
+ #include <iostream>
+ #include <mutex>
+ #include <optional>
+@@ -58,6 +62,55 @@ namespace
+         return leaf.string();
+     }
+ 
++    // PS2X_DIAG_FORCE_MOVIE_DONE=<polls>: DIAGNOSTIC ONLY, off unless the variable
++    // is set. The attract movies never reach their teardown because the EE IPU
++    // block decode is not implemented, so the shell's exit gate never sees
++    // "movie finished". This override replaces the shell's pad-pressed test and,
++    // every <polls> calls, invokes the guest's own movie teardown routine (it does
++    // not poke the flag directly) so the game's own state machine can advance.
++    // It exists to measure the rest of the path (title screen, menu, input) while
++    // the movie decode is being worked on; it must not be on for normal play.
++    void diagForceMovieDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)rdram;
++        static uint32_t s_cadence = 0u;
++        static uint32_t s_polls = 0u;
++        static bool s_announced = false;
++        if (s_cadence == 0u)
++        {
++            const char *spec = std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE");
++            s_cadence = spec ? static_cast<uint32_t>(std::strtoul(spec, nullptr, 0)) : 0u;
++        }
++
++        if (s_cadence != 0u && runtime != nullptr)
++        {
++            if (!s_announced)
++            {
++                std::cerr << "[DIAG] PS2X_DIAG_FORCE_MOVIE_DONE=" << s_cadence
++                          << ": invoking the guest movie teardown every " << s_cadence
++                          << " pad polls. DIAGNOSTIC ONLY." << std::endl;
++                s_announced = true;
++            }
++
++            if ((++s_polls % s_cadence) == 0u)
++            {
++                // Set the movie player object's state to 3, which is the state its
++                // own per-frame pump maps to "stream finished". The pump then calls
++                // the real teardown (FUN_00224308) itself, so the game's own state
++                // machine performs the transition; nothing here writes the exposed
++                // "movie done" flag directly.
++                constexpr uint32_t kPlayerStateAddr = 0x663C00u; // 0x663B58 + 0xA8
++                if (rdram != nullptr)
++                {
++                    *reinterpret_cast<uint32_t *>(rdram + kPlayerStateAddr) = 3u;
++                    std::cerr << "[DIAG] set player state=3 (poll " << s_polls << ")" << std::endl;
++                }
++            }
++        }
++
++        setReturnS32(ctx, 0); // the shell's "is a pad button pressed" test
++    }
++
+     std::optional<PS2Runtime::RecompiledFunction> resolveHandlerByName(std::string_view handlerName)
+     {
+         const std::string_view resolvedSyscall = ps2_runtime_calls::resolveSyscallName(handlerName);
+@@ -125,6 +178,32 @@ namespace ps2_game_overrides
+                        uint32_t fileCrc32,
+                        bool fileCrcValid)
+     {
++        // PS2X_BINDS: text file, one "handler@0xADDR" per line ('#' starts a comment).
++        // Rebinds without regenerating or rebuilding the recompiled game.
++        // shortcut: applies to whichever ELF is loaded, no CRC check; fine while there is one game.
++        if (const char *bindsPath = std::getenv("PS2X_BINDS"))
++        {
++            std::ifstream in(bindsPath);
++            std::string line;
++            while (std::getline(in, line))
++            {
++                line = line.substr(0, line.find('#'));
++                line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
++                const size_t at = line.rfind('@');
++                if (at == std::string::npos)
++                {
++                    continue;
++                }
++                bindAddressHandler(runtime, static_cast<uint32_t>(std::strtoul(line.c_str() + at + 1, nullptr, 0)),
++                                   std::string_view(line).substr(0, at));
++            }
++        }
++
++        if (std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE") != nullptr)
++        {
++            runtime.replaceFunction(0x220618u, &diagForceMovieDone);
++        }
++
+ 
+         std::vector<Descriptor> descriptors;
+         {
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 index f0ad507..e56ed81 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
@@ -2784,687 +2935,6 @@ index 89d8576..ad3430a 100644
      bool readIopMemory(uint32_t address, void *destination, size_t size) const override;
      bool writeIopMemory(uint32_t address, const void *source, size_t size) override;
      bool zeroIopMemory(uint32_t address, size_t size) override;
-diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..d5c9e72 100644
---- a/ps2xRuntime/src/lib/ps2_pad.cpp
-+++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,10 +1,16 @@
- #include "runtime/ps2_pad.h"
- #include "ps2_host_backend.h"
-+#include <chrono>
-+#include <cstdlib>
- #include <cstring>
- 
- namespace
- {
--    constexpr uint8_t kPadAnalogMarker = 0x73;
-+    // PADMAN opens a real controller in digital mode.  The IOP DMA path
-+    // consumes this backend directly, so reporting the DualShock marker
-+    // (0x73) here makes the retail guest reject an otherwise valid pad as
-+    // disconnected.  0x41 is the protocol ID for the initial digital mode.
-+    constexpr uint8_t kPadDigitalMarker = 0x41;
-     constexpr uint8_t kPadStickCenter = 0x80;
- 
-     constexpr uint16_t PAD_LEFT = 0x0080u;
-@@ -32,7 +38,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
- 
-     std::memset(data, 0, 32);
-     data[0] = 0x01;
--    data[1] = kPadAnalogMarker;
-+    data[1] = kPadDigitalMarker;
-     data[2] = 0xFF;
-     data[3] = 0xFF;
-     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
-@@ -87,7 +93,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
-         data[4] = static_cast<uint8_t>(128 + rx * 127);
-         data[5] = static_cast<uint8_t>(128 + ry * 127);
-     }
--    else
-+    // Keep keyboard input available even when a USB gamepad is detected.
-+    // This is useful for mixed-input setups and does not replace the
-+    // gamepad state; both host sources contribute to the same active-low
-+    // controller report.
-     {
-         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-             clearBit(PAD_UP);
-@@ -119,6 +128,43 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
-             clearBit(PAD_SELECT);
-     }
- 
-+    // PS2X_AUTOX=<seconds> is a bounded diagnostic input source.  The retail
-+    // startup path consumes the PADMAN DMA area through this backend, so the
-+    // pulse must be applied here rather than only in the unused scePadRead HLE
-+    // path.  It deliberately affects only Cross and leaves normal host input
-+    // handling unchanged.
-+    static const double autoXStart = std::getenv("PS2X_AUTOX")
-+                                         ? std::atof(std::getenv("PS2X_AUTOX"))
-+                                         : -1.0;
-+    if (autoXStart >= 0.0)
-+    {
-+        static const auto t0 = std::chrono::steady_clock::now();
-+        const double elapsed =
-+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-+        if (elapsed >= autoXStart &&
-+            (static_cast<long>((elapsed - autoXStart) * 1000.0) / 300) % 2 == 0)
-+        {
-+            clearBit(PAD_CROSS);
-+        }
-+    }
-+
-+    // Separate title-screen diagnostic: many retail boot flows wait for
-+    // START before the Cross-confirmed menu becomes active.
-+    static const double autoStart = std::getenv("PS2X_AUTOSTART")
-+                                        ? std::atof(std::getenv("PS2X_AUTOSTART"))
-+                                        : -1.0;
-+    if (autoStart >= 0.0)
-+    {
-+        static const auto startT0 = std::chrono::steady_clock::now();
-+        const double elapsed =
-+            std::chrono::duration<double>(std::chrono::steady_clock::now() - startT0).count();
-+        if (elapsed >= autoStart &&
-+            (static_cast<long>((elapsed - autoStart) * 1000.0) / 300) % 2 == 0)
-+        {
-+            clearBit(PAD_START);
-+        }
-+    }
-+
-     data[2] = static_cast<uint8_t>(btns & 0xFF);
-     data[3] = static_cast<uint8_t>(btns >> 8);
-     return true;
-diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..bcfdf25 100644
---- a/ps2xRuntime/src/lib/ps2_runtime.cpp
-+++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1,4 +1,7 @@
- #include "ps2_runtime.h"
-+#include <cstdio>
-+#include <unordered_set>
-+#include <cstdlib>
- #include "ps2_log.h"
- #include "ps2_stubs.h"
- #include "ps2_syscalls.h"
-@@ -607,7 +610,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
- 
- void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
- {
--    m_iopSubsystem->runEeCycles(eeCycles);
-+    // The EE scheduler reports a few cycles per guest call; running the IOP scheduler for each of
-+    // them dominated the profile. Batch them. shortcut: only the EE executor calls this, so the
-+    // counter is unsynchronized; the IOP lags by at most kIopBatchEeCycles (microseconds).
-+    constexpr uint64_t kIopBatchEeCycles = 4096u;
-+    static uint64_t pendingEeCycles = 0u;
-+    pendingEeCycles += eeCycles;
-+    if (pendingEeCycles >= kIopBatchEeCycles)
-+    {
-+        const uint64_t batch = pendingEeCycles;
-+        pendingEeCycles = 0u;
-+        m_iopSubsystem->runEeCycles(batch);
-+    }
- }
- 
- void PS2Runtime::resetIop()
-@@ -650,6 +664,38 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
-     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
- }
- 
-+extern std::atomic<uint64_t> g_gsSubmitNs;
-+
-+namespace
-+{
-+    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fraÃ§Ã£o da janela e ns por ciclo)
-+    struct Vu1Prof
-+    {
-+        bool on = std::getenv("PS2X_PROF") != nullptr;
-+        std::chrono::steady_clock::time_point winStart = std::chrono::steady_clock::now();
-+        double ns = 0, gsTotal0 = 0, gsInVu = 0;
-+        uint64_t calls = 0, cycles = 0, lastCycles = 0;
-+        void add(double dns, uint64_t cyclesDelta, uint64_t gsIn)
-+        {
-+            ns += dns;
-+            gsInVu += gsIn;
-+            ++calls;
-+            cycles += cyclesDelta;
-+            const auto now = std::chrono::steady_clock::now();
-+            const double win = std::chrono::duration<double, std::nano>(now - winStart).count();
-+            if (win < 10e9)
-+                return;
-+            const double gs = static_cast<double>(g_gsSubmitNs.load()) - gsTotal0;
-+            gsTotal0 += gs;
-+            std::fprintf(stderr, "[prof] vu1_core=%.1f%% gs_in_vu1=%.1f%% gs_total=%.1f%% calls=%llu cycles=%llu core_ns/cycle=%.0f\n", 100.0 * (ns - gsInVu) / win, 100.0 * gsInVu / win, 100.0 * gs / win,
-+                         (unsigned long long)calls, (unsigned long long)cycles, cycles ? (ns - gsInVu) / cycles : 0.0);
-+            winStart = now;
-+            ns = gsInVu = 0;
-+            calls = cycles = 0;
-+        }
-+    } g_vu1Prof;
-+}
-+
- bool PS2Runtime::syncCoreSubsystems()
- {
-     uint8_t *const rdram = m_memory.getRDRAM();
-@@ -679,9 +725,14 @@ bool PS2Runtime::syncCoreSubsystems()
-                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                      m_vu1.state().tBitEnabled =
-                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-+                                     const auto profT0 = std::chrono::steady_clock::now();
-+                                     const uint64_t profG0 = g_gsSubmitNs.load();
-+                                     const uint64_t profC0 = m_vu1.state().cycles;
-                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-+                                     if (g_vu1Prof.on)
-+                                         g_vu1Prof.add(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - profT0).count(), m_vu1.state().cycles - profC0, g_gsSubmitNs.load() - profG0);
-                                      cpuContext->vu0_vpu_stat =
-                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -697,9 +748,14 @@ bool PS2Runtime::syncCoreSubsystems()
-                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                      m_vu1.state().tBitEnabled =
-                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-+                                     const auto profT0 = std::chrono::steady_clock::now();
-+                                     const uint64_t profG0 = g_gsSubmitNs.load();
-+                                     const uint64_t profC0 = m_vu1.state().cycles;
-                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, top, itop, 65536);
-+                                     if (g_vu1Prof.on)
-+                                         g_vu1Prof.add(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - profT0).count(), m_vu1.state().cycles - profC0, g_gsSubmitNs.load() - profG0);
-                                      cpuContext->vu0_vpu_stat =
-                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-@@ -1065,6 +1121,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
-         paths.mcRoot = paths.elfDirectory / "mc0";
-     }
- 
-+    if (const char *image = std::getenv("PS2X_CD_IMAGE"))
-+    {
-+        paths.cdImage = image;
-+    }
-+
-     setIoPaths(paths);
- }
- 
-@@ -1353,6 +1414,76 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
-     ctx->pc = targetPc;
-     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
- 
-+    // PS2X_TRACE_CALLS="0xADDR,0xADDR": logs the first calls to those guest addresses (debug aid).
-+    static const std::unordered_set<uint32_t> tracedCalls = []()
-+    {
-+        std::unordered_set<uint32_t> set;
-+        if (const char *spec = std::getenv("PS2X_TRACE_CALLS"))
-+        {
-+            std::stringstream ss(spec);
-+            std::string item;
-+            while (std::getline(ss, item, ','))
-+                set.insert(static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 0)));
-+        }
-+        return set;
-+    }();
-+    static const bool traceAllCalls = []()
-+    {
-+        const char *spec = std::getenv("PS2X_TRACE_CALLS");
-+        return spec != nullptr && (std::strcmp(spec, "all") == 0 || std::strcmp(spec, "ALL") == 0);
-+    }();
-+    if (isCall && ((!tracedCalls.empty() && tracedCalls.count(targetPc) != 0) || traceAllCalls))
-+    {
-+        static std::atomic<int> tracedPrinted{0};
-+        if (tracedPrinted.fetch_add(1) < (traceAllCalls ? 1200 : 400))
-+            std::fprintf(stderr, "[call] %x a0=%x a1=%x a2=%x a3=%x s0=%x ra=%x\n", targetPc, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
-+                         GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 16), sourcePc);
-+    }
-+
-+    // PS2X_TRACE_LOADER=1: bounded observations of the retail resource worker.
-+    // This only reads guest memory; it never changes the loader state.
-+    if (isCall && std::getenv("PS2X_TRACE_LOADER") != nullptr &&
-+        ((targetPc == 0x1B4DD0u && sourcePc == 0x190218u) || sourcePc == 0x19023Cu))
-+    {
-+        static std::atomic<int> loaderPrinted{0};
-+        if (loaderPrinted.fetch_add(1) < 160)
-+        {
-+            const auto readGuest32 = [rdram](uint32_t address) -> uint32_t
-+            {
-+                if (address > PS2_RAM_SIZE - sizeof(uint32_t))
-+                    return 0u;
-+                uint32_t value = 0u;
-+                std::memcpy(&value, rdram + address, sizeof(value));
-+                return value;
-+            };
-+            const bool workerCall = targetPc == 0x1B4DD0u && sourcePc == 0x190218u;
-+            const uint32_t object = workerCall ? GPR_U32(ctx, 4) : 0u;
-+            const uint32_t resource = workerCall ? readGuest32(object + 0x150u) : GPR_U32(ctx, 16);
-+            const uint32_t handler = readGuest32(resource + 0x4F8u);
-+            const uint32_t callback = readGuest32(handler + 0x0Cu);
-+            std::fprintf(stderr,
-+                         "[loader-state] target=0x%x source=0x%x object=0x%x "
-+                         "12c=%u 12d=%u resource=0x%x res4b9=%u handler=0x%x "
-+                         "callback=0x%x a0=0x%x s0=0x%x\n",
-+                         targetPc, sourcePc, object,
-+                         workerCall ? readGuest32(object + 0x12Cu) & 0xFFu : 0u,
-+                         workerCall ? readGuest32(object + 0x12Du) & 0xFFu : 0u,
-+                         resource, readGuest32(resource + 0x4B9u) & 0xFFu,
-+                         handler, callback, GPR_U32(ctx, 4), GPR_U32(ctx, 16));
-+        }
-+    }
-+
-+    if (isCall && std::getenv("PS2X_TRACE_LOADER") != nullptr &&
-+        (targetPc == 0x190410u || targetPc == 0x190448u || targetPc == 0x190528u ||
-+         targetPc == 0x1908D0u || targetPc == 0x188338u))
-+    {
-+        static std::atomic<int> callbackTracePrinted{0};
-+        if (callbackTracePrinted.fetch_add(1) < 160)
-+            std::fprintf(stderr, "[loader-call] target=0x%x source=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x s0=0x%x ra=0x%x\n",
-+                         targetPc, sourcePc, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6),
-+                         GPR_U32(ctx, 7), GPR_U32(ctx, 16), GPR_U32(ctx, 31));
-+    }
-+
-     // Every inter-function transfer is also a deterministic EE safe point.
-     // Backward edges inside generated functions use eeCheckpointDue(), while
-     // this charge bounds straight-line call chains that have no local loop.
-@@ -2386,8 +2517,25 @@ void PS2Runtime::run()
-         gameThreadFinished.store(true, std::memory_order_release); });
- 
-     uint64_t tick = 0;
-+    // PS2X_DUMP_RAM="seconds:path": writes the 32MB EE RAM once after that many seconds (debug aid).
-+    const char *dumpRamSpec = std::getenv("PS2X_DUMP_RAM");
-+    const auto dumpRamStart = std::chrono::steady_clock::now();
-+    bool dumpRamDone = (dumpRamSpec == nullptr);
-     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
-     {
-+        if (!dumpRamDone)
-+        {
-+            const std::string spec(dumpRamSpec);
-+            const size_t colon = spec.find(':');
-+            const double secs = std::atof(spec.substr(0, colon).c_str());
-+            if (colon != std::string::npos &&
-+                std::chrono::duration<double>(std::chrono::steady_clock::now() - dumpRamStart).count() >= secs)
-+            {
-+                std::ofstream out(spec.substr(colon + 1), std::ios::binary);
-+                out.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
-+                dumpRamDone = true;
-+            }
-+        }
-         PS2_IF_AGRESSIVE_LOGS({
-             tick++;
-             if ((tick % 120) == 0)
-@@ -2418,6 +2566,21 @@ void PS2Runtime::run()
-                                                << " vif=" << curVif
-                                                << std::endl);
- 
-+                if (std::getenv("PS2X_TRACE_THREADS") != nullptr)
-+                {
-+                    for (const auto &thread : eeSnapshot.threads)
-+                    {
-+                        RUNTIME_LOG("[run:thread] id=" << thread.id
-+                                                       << " pc=0x" << std::hex << thread.pc
-+                                                       << " ra=0x" << thread.ra
-+                                                       << " status=" << std::dec
-+                                                       << static_cast<int>(thread.status)
-+                                                       << " wait=" << thread.waitId
-+                                                       << " entry=0x" << std::hex << thread.entry
-+                                                       << std::dec << std::endl);
-+                    }
-+                }
-+
-             }
-         });
-         uint32_t presentWidth = FB_WIDTH;
-diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..95aacce 100644
---- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-+++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -66,6 +66,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
- 
- void VU1Interpreter::resetScheduler()
- {
-+    m_nextReady = 0;
-     m_flagPipeline = {};
-     m_fdiv = {};
-     m_efu = {};
-@@ -533,6 +534,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
-     entry->valid = true;
-     entry->issueCycle = m_cycle;
-     entry->readyCycle = m_cycle + kFmacLatency;
-+    noteReady(entry->readyCycle);
-     entry->mac = mac;
-     entry->status = status;
-     entry->extraSticky = extraSticky;
-@@ -572,6 +574,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
-             entry.valid = true;
-             entry.issueCycle = m_cycle;
-             entry.readyCycle = m_cycle + kFmacLatency;
-+            noteReady(entry.readyCycle);
-             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
-             entry.writesSticky = true;
-             return;
-@@ -591,6 +594,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
-             entry.valid = true;
-             entry.issueCycle = m_cycle;
-             entry.readyCycle = m_cycle + kFmacLatency;
-+            noteReady(entry.readyCycle);
-             entry.clip = m_workingClip;
-             entry.writesClip = true;
-             return;
-@@ -615,6 +619,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
-             entry.valid = true;
-             entry.issueCycle = m_cycle;
-             entry.readyCycle = m_cycle + kFmacLatency;
-+            noteReady(entry.readyCycle);
-             entry.clip = m_workingClip;
-             entry.writesClip = true;
-             return;
-@@ -629,6 +634,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
-     value = normalizeResult(value, ignoredFlags);
-     m_fdiv.valid = true;
-     m_fdiv.readyCycle = m_cycle + latency;
-+    noteReady(m_fdiv.readyCycle);
-     m_fdiv.value = value;
-     m_fdiv.statusDi = statusDi & 0x30u;
- }
-@@ -643,6 +649,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
-         {
-             entry.valid = true;
-             entry.readyCycle = m_cycle + latency;
-+            noteReady(entry.readyCycle);
-             entry.value = value;
-             // EFU throughput is one cycle shorter than result visibility.
-             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
-@@ -660,6 +667,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
-         {
-             store.valid = true;
-             store.readyCycle = m_cycle + 1u;
-+            noteReady(store.readyCycle);
-             store.address = address;
-             store.laneMask = laneMask;
-             std::copy(words, words + 4, store.words.begin());
-@@ -681,6 +689,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
-             write = {};
-             write.valid = true;
-             write.readyCycle = m_cycle + latency;
-+            noteReady(write.readyCycle);
-             write.sequence = ++m_nextWriteSequence;
-             write.reg = reg;
-             write.laneMask = laneMask;
-@@ -707,6 +716,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
-             write = {};
-             write.valid = true;
-             write.readyCycle = m_cycle + latency;
-+            noteReady(write.readyCycle);
-             write.sequence = ++m_nextWriteSequence;
-             write.reg = reg;
-             write.value = value;
-@@ -728,6 +738,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
-             write = {};
-             write.valid = true;
-             write.readyCycle = m_cycle + latency;
-+            noteReady(write.readyCycle);
-             write.sequence = ++m_nextWriteSequence;
-             write.laneMask = laneMask;
-             std::copy(value, value + 4, write.value.begin());
-@@ -744,10 +755,20 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
- 
- void VU1Interpreter::commitReadyPipelines()
- {
-+    if (m_cycle < m_nextReady)
-+        return;
-+    uint64_t nextReady = UINT64_MAX;
-+    auto pending = [&nextReady](uint64_t c) { if (c < nextReady) nextReady = c; };
-+
-     for (FlagPipelineEntry &entry : m_flagPipeline)
-     {
--        if (!entry.valid || entry.readyCycle > m_cycle)
-+        if (!entry.valid)
-             continue;
-+        if (entry.readyCycle > m_cycle)
-+        {
-+            pending(entry.readyCycle);
-+            continue;
-+        }
- 
-         if (entry.writesMac)
-             m_state.mac = entry.mac;
-@@ -765,6 +786,8 @@ void VU1Interpreter::commitReadyPipelines()
-         entry = {};
-     }
- 
-+    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
-+        pending(m_fdiv.readyCycle);
-     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
-     {
-         m_state.q = m_fdiv.value;
-@@ -780,12 +803,19 @@ void VU1Interpreter::commitReadyPipelines()
-             m_state.p = entry.value;
-             entry = {};
-         }
-+        else if (entry.valid)
-+            pending(entry.readyCycle);
-     }
- 
-     for (PendingStore &store : m_storePipeline)
-     {
--        if (!store.valid || store.readyCycle > m_cycle)
-+        if (!store.valid)
-+            continue;
-+        if (store.readyCycle > m_cycle)
-+        {
-+            pending(store.readyCycle);
-             continue;
-+        }
-         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
-         {
-             uint32_t oldWords[4]{};
-@@ -802,8 +832,13 @@ void VU1Interpreter::commitReadyPipelines()
- 
-     for (PendingVfWrite &write : m_vfWritePipeline)
-     {
--        if (!write.valid || write.readyCycle > m_cycle)
-+        if (!write.valid)
-             continue;
-+        if (write.readyCycle > m_cycle)
-+        {
-+            pending(write.readyCycle);
-+            continue;
-+        }
-         for (uint32_t component = 0; component < 4u; ++component)
-         {
-             if ((write.laneMask & laneForComponent(component)) != 0u &&
-@@ -817,8 +852,13 @@ void VU1Interpreter::commitReadyPipelines()
- 
-     for (PendingViWrite &write : m_viWritePipeline)
-     {
--        if (!write.valid || write.readyCycle > m_cycle)
-+        if (!write.valid)
-             continue;
-+        if (write.readyCycle > m_cycle)
-+        {
-+            pending(write.readyCycle);
-+            continue;
-+        }
-         if (m_viLatestWrite[write.reg] == write.sequence)
-             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-         write = {};
-@@ -826,8 +866,13 @@ void VU1Interpreter::commitReadyPipelines()
- 
-     for (PendingAccWrite &write : m_accWritePipeline)
-     {
--        if (!write.valid || write.readyCycle > m_cycle)
-+        if (!write.valid)
-+            continue;
-+        if (write.readyCycle > m_cycle)
-+        {
-+            pending(write.readyCycle);
-             continue;
-+        }
-         for (uint32_t component = 0; component < 4u; ++component)
-         {
-             if ((write.laneMask & laneForComponent(component)) != 0u &&
-@@ -838,6 +883,7 @@ void VU1Interpreter::commitReadyPipelines()
-         }
-         write = {};
-     }
-+    m_nextReady = nextReady;
- }
- 
- void VU1Interpreter::progressXgkick()
-@@ -919,6 +965,7 @@ void VU1Interpreter::finishXgkick()
-     if (!m_xgkick.active)
-         return;
- 
-+
-     if (m_activeMemory)
-         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
-     else if (m_activeGs)
-diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
-index ea86a9c..55fa018 100644
---- a/ps2xRuntime/include/runtime/ps2_memory.h
-+++ b/ps2xRuntime/include/runtime/ps2_memory.h
-@@ -296,6 +296,20 @@ public:
-     void write64(uint32_t address, uint64_t value);
-     void write128(uint32_t address, __m128i value);
- 
-+    // ---- EE IPU (image processing unit) --------------------------------------
-+    // The IPU is a hardware MPEG1/MPEG2 decoder. What is modelled here is the
-+    // bitstream interface the game's own MPEG player drives: the IPU_FROM DMA
-+    // channel feeds the input FIFO, IPU_CMD carries the "fetch N bits" command
-+    // and reading it back returns the 32 bits at the bit pointer IPU_BP, which
-+    // the command then advances. The macroblock decode (IDCT) is not implemented
-+    // yet, so no decoded picture is produced, but the elementary stream parses.
-+    void ipuReset();
-+    void ipuWriteCmd(uint32_t value);
-+    void ipuFeed(const uint8_t *data, size_t size);
-+    uint32_t ipuReadCmdBits();
-+    void ipuRunChannelDma(uint32_t channelBase, uint32_t chcr);
-+    void ipuChainPump(size_t wantBytes);
-+
-     // TLB handling
-     uint32_t translateAddress(uint32_t virtualAddress);
-     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
-@@ -421,6 +435,18 @@ public:
-     std::vector<PendingTransfer> m_pendingGifTransfers;
-     std::vector<PendingTransfer> m_pendingVif0Transfers;
-     std::vector<PendingTransfer> m_pendingVif1Transfers;
-+
-+    std::vector<uint8_t> m_ipuIn; // bitstream bytes fed to the IPU input FIFO
-+    uint64_t m_ipuBitPos = 0u;    // absolute bit pointer into m_ipuIn (IPU_BP)
-+    uint32_t m_ipuCtrl = 0u;      // IPU_CTRL, BUSY (bit 31) never set
-+
-+    // The IPU input DMA runs at hardware pace: the bitstream buffer is filled by
-+    // the CD stream, so chunks are pulled from guest RAM only when the parser
-+    // actually needs them, not when the channel is programmed.
-+    bool m_ipuChainActive = false;
-+    uint32_t m_ipuChainTagAddr = 0u;
-+    uint32_t m_ipuChainDataAddr = 0u;
-+    uint32_t m_ipuChainRemainingQw = 0u;
-     std::mutex m_completedDmacMutex;
-     std::vector<uint32_t> m_completedDmacCauses;
- 
-diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 1e38bd4..54b1297 100644
---- a/ps2xRuntime/src/lib/game_overrides.cpp
-+++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -4,9 +4,13 @@
- #include "ps2_stubs.h"
- #include "ps2_syscalls.h"
- #include "ps2_log.h"
-+#include "ps2_runtime_macros.h"
-+#include "runtime/ee_scheduler.h"
- #include <algorithm>
- #include <cctype>
-+#include <cstdlib>
- #include <filesystem>
-+#include <fstream>
- #include <iostream>
- #include <mutex>
- #include <optional>
-@@ -58,6 +62,55 @@ namespace
-         return leaf.string();
-     }
- 
-+    // PS2X_DIAG_FORCE_MOVIE_DONE=<polls>: DIAGNOSTIC ONLY, off unless the variable
-+    // is set. The attract movies never reach their teardown because the EE IPU
-+    // block decode is not implemented, so the shell's exit gate never sees
-+    // "movie finished". This override replaces the shell's pad-pressed test and,
-+    // every <polls> calls, invokes the guest's own movie teardown routine (it does
-+    // not poke the flag directly) so the game's own state machine can advance.
-+    // It exists to measure the rest of the path (title screen, menu, input) while
-+    // the movie decode is being worked on; it must not be on for normal play.
-+    void diagForceMovieDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-+    {
-+        (void)rdram;
-+        static uint32_t s_cadence = 0u;
-+        static uint32_t s_polls = 0u;
-+        static bool s_announced = false;
-+        if (s_cadence == 0u)
-+        {
-+            const char *spec = std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE");
-+            s_cadence = spec ? static_cast<uint32_t>(std::strtoul(spec, nullptr, 0)) : 0u;
-+        }
-+
-+        if (s_cadence != 0u && runtime != nullptr)
-+        {
-+            if (!s_announced)
-+            {
-+                std::cerr << "[DIAG] PS2X_DIAG_FORCE_MOVIE_DONE=" << s_cadence
-+                          << ": invoking the guest movie teardown every " << s_cadence
-+                          << " pad polls. DIAGNOSTIC ONLY." << std::endl;
-+                s_announced = true;
-+            }
-+
-+            if ((++s_polls % s_cadence) == 0u)
-+            {
-+                // Set the movie player object's state to 3, which is the state its
-+                // own per-frame pump maps to "stream finished". The pump then calls
-+                // the real teardown (FUN_00224308) itself, so the game's own state
-+                // machine performs the transition; nothing here writes the exposed
-+                // "movie done" flag directly.
-+                constexpr uint32_t kPlayerStateAddr = 0x663C00u; // 0x663B58 + 0xA8
-+                if (rdram != nullptr)
-+                {
-+                    *reinterpret_cast<uint32_t *>(rdram + kPlayerStateAddr) = 3u;
-+                    std::cerr << "[DIAG] set player state=3 (poll " << s_polls << ")" << std::endl;
-+                }
-+            }
-+        }
-+
-+        setReturnS32(ctx, 0); // the shell's "is a pad button pressed" test
-+    }
-+
-     std::optional<PS2Runtime::RecompiledFunction> resolveHandlerByName(std::string_view handlerName)
-     {
-         const std::string_view resolvedSyscall = ps2_runtime_calls::resolveSyscallName(handlerName);
-@@ -125,6 +178,32 @@ namespace ps2_game_overrides
-                        uint32_t fileCrc32,
-                        bool fileCrcValid)
-     {
-+        // PS2X_BINDS: text file, one "handler@0xADDR" per line ('#' starts a comment).
-+        // Rebinds without regenerating or rebuilding the recompiled game.
-+        // shortcut: applies to whichever ELF is loaded, no CRC check; fine while there is one game.
-+        if (const char *bindsPath = std::getenv("PS2X_BINDS"))
-+        {
-+            std::ifstream in(bindsPath);
-+            std::string line;
-+            while (std::getline(in, line))
-+            {
-+                line = line.substr(0, line.find('#'));
-+                line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) { return std::isspace(c); }), line.end());
-+                const size_t at = line.rfind('@');
-+                if (at == std::string::npos)
-+                {
-+                    continue;
-+                }
-+                bindAddressHandler(runtime, static_cast<uint32_t>(std::strtoul(line.c_str() + at + 1, nullptr, 0)),
-+                                   std::string_view(line).substr(0, at));
-+            }
-+        }
-+
-+        if (std::getenv("PS2X_DIAG_FORCE_MOVIE_DONE") != nullptr)
-+        {
-+            runtime.replaceFunction(0x220618u, &diagForceMovieDone);
-+        }
-+
- 
-         std::vector<Descriptor> descriptors;
-         {
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index 37b6a4d..34a3302 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
@@ -3936,3 +3406,578 @@ index 37b6a4d..34a3302 100644
      }
  
      if (address == 0x10003020u) // GIF_STAT
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..d5c9e72 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,10 +1,16 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace
+ {
+-    constexpr uint8_t kPadAnalogMarker = 0x73;
++    // PADMAN opens a real controller in digital mode.  The IOP DMA path
++    // consumes this backend directly, so reporting the DualShock marker
++    // (0x73) here makes the retail guest reject an otherwise valid pad as
++    // disconnected.  0x41 is the protocol ID for the initial digital mode.
++    constexpr uint8_t kPadDigitalMarker = 0x41;
+     constexpr uint8_t kPadStickCenter = 0x80;
+ 
+     constexpr uint16_t PAD_LEFT = 0x0080u;
+@@ -32,7 +38,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+ 
+     std::memset(data, 0, 32);
+     data[0] = 0x01;
+-    data[1] = kPadAnalogMarker;
++    data[1] = kPadDigitalMarker;
+     data[2] = 0xFF;
+     data[3] = 0xFF;
+     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+@@ -87,7 +93,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         data[4] = static_cast<uint8_t>(128 + rx * 127);
+         data[5] = static_cast<uint8_t>(128 + ry * 127);
+     }
+-    else
++    // Keep keyboard input available even when a USB gamepad is detected.
++    // This is useful for mixed-input setups and does not replace the
++    // gamepad state; both host sources contribute to the same active-low
++    // controller report.
+     {
+         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+             clearBit(PAD_UP);
+@@ -119,6 +128,43 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_SELECT);
+     }
+ 
++    // PS2X_AUTOX=<seconds> is a bounded diagnostic input source.  The retail
++    // startup path consumes the PADMAN DMA area through this backend, so the
++    // pulse must be applied here rather than only in the unused scePadRead HLE
++    // path.  It deliberately affects only Cross and leaves normal host input
++    // handling unchanged.
++    static const double autoXStart = std::getenv("PS2X_AUTOX")
++                                         ? std::atof(std::getenv("PS2X_AUTOX"))
++                                         : -1.0;
++    if (autoXStart >= 0.0)
++    {
++        static const auto t0 = std::chrono::steady_clock::now();
++        const double elapsed =
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        if (elapsed >= autoXStart &&
++            (static_cast<long>((elapsed - autoXStart) * 1000.0) / 300) % 2 == 0)
++        {
++            clearBit(PAD_CROSS);
++        }
++    }
++
++    // Separate title-screen diagnostic: many retail boot flows wait for
++    // START before the Cross-confirmed menu becomes active.
++    static const double autoStart = std::getenv("PS2X_AUTOSTART")
++                                        ? std::atof(std::getenv("PS2X_AUTOSTART"))
++                                        : -1.0;
++    if (autoStart >= 0.0)
++    {
++        static const auto startT0 = std::chrono::steady_clock::now();
++        const double elapsed =
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - startT0).count();
++        if (elapsed >= autoStart &&
++            (static_cast<long>((elapsed - autoStart) * 1000.0) / 300) % 2 == 0)
++        {
++            clearBit(PAD_START);
++        }
++    }
++
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..fad95f3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,7 @@
+ #include "ps2_runtime.h"
++#include <cstdio>
++#include <unordered_set>
++#include <cstdlib>
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -444,6 +447,44 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+         ++s_uploadDebugCount;
+     });
++    if (std::getenv("PS2X_TRACE_FRAME_STATS") != nullptr)
++    {
++        static uint32_t s_statsCount = 0u;
++        if (s_statsCount < 12u)
++        {
++            uint64_t nonBlack = 0u;
++            uint64_t purple = 0u;
++            for (uint32_t y = 0u; y < height; ++y)
++            {
++                for (uint32_t x = 0u; x < width; ++x)
++                {
++                    const uint8_t *p = s_scratch.data() + (static_cast<size_t>(y) * width + x) * 4u;
++                    if (p[0] != 0u || p[1] != 0u || p[2] != 0u)
++                        ++nonBlack;
++                    if (p[0] > 80u && p[2] > 80u && p[1] < 80u)
++                        ++purple;
++                }
++            }
++            const uint8_t *p0 = s_scratch.empty() ? nullptr : s_scratch.data();
++            const uint8_t *pc = (width > 320u && height > 224u) ? s_scratch.data() + (static_cast<size_t>(224u) * width + 320u) * 4u : nullptr;
++            const uint8_t *pb = (width != 0u && height != 0u) ? s_scratch.data() + (static_cast<size_t>(height - 1u) * width + (width - 1u)) * 4u : nullptr;
++            std::cerr << "[frame:stats] n=" << s_statsCount
++                      << " nonBlack=" << nonBlack
++                      << " purple=" << purple
++                      << " first=" << (p0 ? static_cast<unsigned>(p0[0]) : 0u)
++                      << "," << (p0 ? static_cast<unsigned>(p0[1]) : 0u)
++                      << "," << (p0 ? static_cast<unsigned>(p0[2]) : 0u)
++                      << "," << (p0 ? static_cast<unsigned>(p0[3]) : 0u)
++                      << " center=" << (pc ? static_cast<unsigned>(pc[0]) : 0u)
++                      << "," << (pc ? static_cast<unsigned>(pc[1]) : 0u)
++                      << "," << (pc ? static_cast<unsigned>(pc[2]) : 0u)
++                      << " bottom=" << (pb ? static_cast<unsigned>(pb[0]) : 0u)
++                      << "," << (pb ? static_cast<unsigned>(pb[1]) : 0u)
++                      << "," << (pb ? static_cast<unsigned>(pb[2]) : 0u)
++                      << std::dec << std::endl;
++            ++s_statsCount;
++        }
++    }
+     s_lastDisplayFbp = displayFbp;
+     s_lastSourceFbp = sourceFbp;
+     s_lastPreferred = usedPreferredDisplaySource;
+@@ -607,7 +648,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+-    m_iopSubsystem->runEeCycles(eeCycles);
++    // The EE scheduler reports a few cycles per guest call; running the IOP scheduler for each of
++    // them dominated the profile. Batch them. shortcut: only the EE executor calls this, so the
++    // counter is unsynchronized; the IOP lags by at most kIopBatchEeCycles (microseconds).
++    constexpr uint64_t kIopBatchEeCycles = 4096u;
++    static uint64_t pendingEeCycles = 0u;
++    pendingEeCycles += eeCycles;
++    if (pendingEeCycles >= kIopBatchEeCycles)
++    {
++        const uint64_t batch = pendingEeCycles;
++        pendingEeCycles = 0u;
++        m_iopSubsystem->runEeCycles(batch);
++    }
+ }
+ 
+ void PS2Runtime::resetIop()
+@@ -650,6 +702,38 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+ }
+ 
++extern std::atomic<uint64_t> g_gsSubmitNs;
++
++namespace
++{
++    // PS2X_PROF=1: a cada 10 s imprime o tempo gasto no VU1 (fração da janela e ns por ciclo)
++    struct Vu1Prof
++    {
++        bool on = std::getenv("PS2X_PROF") != nullptr;
++        std::chrono::steady_clock::time_point winStart = std::chrono::steady_clock::now();
++        double ns = 0, gsTotal0 = 0, gsInVu = 0;
++        uint64_t calls = 0, cycles = 0, lastCycles = 0;
++        void add(double dns, uint64_t cyclesDelta, uint64_t gsIn)
++        {
++            ns += dns;
++            gsInVu += gsIn;
++            ++calls;
++            cycles += cyclesDelta;
++            const auto now = std::chrono::steady_clock::now();
++            const double win = std::chrono::duration<double, std::nano>(now - winStart).count();
++            if (win < 10e9)
++                return;
++            const double gs = static_cast<double>(g_gsSubmitNs.load()) - gsTotal0;
++            gsTotal0 += gs;
++            std::fprintf(stderr, "[prof] vu1_core=%.1f%% gs_in_vu1=%.1f%% gs_total=%.1f%% calls=%llu cycles=%llu core_ns/cycle=%.0f\n", 100.0 * (ns - gsInVu) / win, 100.0 * gsInVu / win, 100.0 * gs / win,
++                         (unsigned long long)calls, (unsigned long long)cycles, cycles ? (ns - gsInVu) / cycles : 0.0);
++            winStart = now;
++            ns = gsInVu = 0;
++            calls = cycles = 0;
++        }
++    } g_vu1Prof;
++}
++
+ bool PS2Runtime::syncCoreSubsystems()
+ {
+     uint8_t *const rdram = m_memory.getRDRAM();
+@@ -679,9 +763,14 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const auto profT0 = std::chrono::steady_clock::now();
++                                     const uint64_t profG0 = g_gsSubmitNs.load();
++                                     const uint64_t profC0 = m_vu1.state().cycles;
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
++                                     if (g_vu1Prof.on)
++                                         g_vu1Prof.add(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - profT0).count(), m_vu1.state().cycles - profC0, g_gsSubmitNs.load() - profG0);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -697,9 +786,14 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const auto profT0 = std::chrono::steady_clock::now();
++                                     const uint64_t profG0 = g_gsSubmitNs.load();
++                                     const uint64_t profC0 = m_vu1.state().cycles;
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
++                                     if (g_vu1Prof.on)
++                                         g_vu1Prof.add(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - profT0).count(), m_vu1.state().cycles - profC0, g_gsSubmitNs.load() - profG0);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -1065,6 +1159,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
+ 
++    if (const char *image = std::getenv("PS2X_CD_IMAGE"))
++    {
++        paths.cdImage = image;
++    }
++
+     setIoPaths(paths);
+ }
+ 
+@@ -1353,6 +1452,76 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
++    // PS2X_TRACE_CALLS="0xADDR,0xADDR": logs the first calls to those guest addresses (debug aid).
++    static const std::unordered_set<uint32_t> tracedCalls = []()
++    {
++        std::unordered_set<uint32_t> set;
++        if (const char *spec = std::getenv("PS2X_TRACE_CALLS"))
++        {
++            std::stringstream ss(spec);
++            std::string item;
++            while (std::getline(ss, item, ','))
++                set.insert(static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 0)));
++        }
++        return set;
++    }();
++    static const bool traceAllCalls = []()
++    {
++        const char *spec = std::getenv("PS2X_TRACE_CALLS");
++        return spec != nullptr && (std::strcmp(spec, "all") == 0 || std::strcmp(spec, "ALL") == 0);
++    }();
++    if (isCall && ((!tracedCalls.empty() && tracedCalls.count(targetPc) != 0) || traceAllCalls))
++    {
++        static std::atomic<int> tracedPrinted{0};
++        if (tracedPrinted.fetch_add(1) < (traceAllCalls ? 1200 : 400))
++            std::fprintf(stderr, "[call] %x a0=%x a1=%x a2=%x a3=%x s0=%x ra=%x\n", targetPc, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
++                         GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 16), sourcePc);
++    }
++
++    // PS2X_TRACE_LOADER=1: bounded observations of the retail resource worker.
++    // This only reads guest memory; it never changes the loader state.
++    if (isCall && std::getenv("PS2X_TRACE_LOADER") != nullptr &&
++        ((targetPc == 0x1B4DD0u && sourcePc == 0x190218u) || sourcePc == 0x19023Cu))
++    {
++        static std::atomic<int> loaderPrinted{0};
++        if (loaderPrinted.fetch_add(1) < 160)
++        {
++            const auto readGuest32 = [rdram](uint32_t address) -> uint32_t
++            {
++                if (address > PS2_RAM_SIZE - sizeof(uint32_t))
++                    return 0u;
++                uint32_t value = 0u;
++                std::memcpy(&value, rdram + address, sizeof(value));
++                return value;
++            };
++            const bool workerCall = targetPc == 0x1B4DD0u && sourcePc == 0x190218u;
++            const uint32_t object = workerCall ? GPR_U32(ctx, 4) : 0u;
++            const uint32_t resource = workerCall ? readGuest32(object + 0x150u) : GPR_U32(ctx, 16);
++            const uint32_t handler = readGuest32(resource + 0x4F8u);
++            const uint32_t callback = readGuest32(handler + 0x0Cu);
++            std::fprintf(stderr,
++                         "[loader-state] target=0x%x source=0x%x object=0x%x "
++                         "12c=%u 12d=%u resource=0x%x res4b9=%u handler=0x%x "
++                         "callback=0x%x a0=0x%x s0=0x%x\n",
++                         targetPc, sourcePc, object,
++                         workerCall ? readGuest32(object + 0x12Cu) & 0xFFu : 0u,
++                         workerCall ? readGuest32(object + 0x12Du) & 0xFFu : 0u,
++                         resource, readGuest32(resource + 0x4B9u) & 0xFFu,
++                         handler, callback, GPR_U32(ctx, 4), GPR_U32(ctx, 16));
++        }
++    }
++
++    if (isCall && std::getenv("PS2X_TRACE_LOADER") != nullptr &&
++        (targetPc == 0x190410u || targetPc == 0x190448u || targetPc == 0x190528u ||
++         targetPc == 0x1908D0u || targetPc == 0x188338u))
++    {
++        static std::atomic<int> callbackTracePrinted{0};
++        if (callbackTracePrinted.fetch_add(1) < 160)
++            std::fprintf(stderr, "[loader-call] target=0x%x source=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x s0=0x%x ra=0x%x\n",
++                         targetPc, sourcePc, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6),
++                         GPR_U32(ctx, 7), GPR_U32(ctx, 16), GPR_U32(ctx, 31));
++    }
++
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+     // this charge bounds straight-line call chains that have no local loop.
+@@ -2386,8 +2555,25 @@ void PS2Runtime::run()
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
+     uint64_t tick = 0;
++    // PS2X_DUMP_RAM="seconds:path": writes the 32MB EE RAM once after that many seconds (debug aid).
++    const char *dumpRamSpec = std::getenv("PS2X_DUMP_RAM");
++    const auto dumpRamStart = std::chrono::steady_clock::now();
++    bool dumpRamDone = (dumpRamSpec == nullptr);
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        if (!dumpRamDone)
++        {
++            const std::string spec(dumpRamSpec);
++            const size_t colon = spec.find(':');
++            const double secs = std::atof(spec.substr(0, colon).c_str());
++            if (colon != std::string::npos &&
++                std::chrono::duration<double>(std::chrono::steady_clock::now() - dumpRamStart).count() >= secs)
++            {
++                std::ofstream out(spec.substr(colon + 1), std::ios::binary);
++                out.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
++                dumpRamDone = true;
++            }
++        }
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)
+@@ -2418,6 +2604,21 @@ void PS2Runtime::run()
+                                                << " vif=" << curVif
+                                                << std::endl);
+ 
++                if (std::getenv("PS2X_TRACE_THREADS") != nullptr)
++                {
++                    for (const auto &thread : eeSnapshot.threads)
++                    {
++                        RUNTIME_LOG("[run:thread] id=" << thread.id
++                                                       << " pc=0x" << std::hex << thread.pc
++                                                       << " ra=0x" << thread.ra
++                                                       << " status=" << std::dec
++                                                       << static_cast<int>(thread.status)
++                                                       << " wait=" << thread.waitId
++                                                       << " entry=0x" << std::hex << thread.entry
++                                                       << std::dec << std::endl);
++                    }
++                }
++
+             }
+         });
+         uint32_t presentWidth = FB_WIDTH;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..95aacce 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -66,6 +66,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ void VU1Interpreter::resetScheduler()
+ {
++    m_nextReady = 0;
+     m_flagPipeline = {};
+     m_fdiv = {};
+     m_efu = {};
+@@ -533,6 +534,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    noteReady(entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +574,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteReady(entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +594,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +619,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            noteReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +634,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    noteReady(m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +649,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            noteReady(entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +667,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            noteReady(store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +689,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +716,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +738,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            noteReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,10 +755,20 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    if (m_cycle < m_nextReady)
++        return;
++    uint64_t nextReady = UINT64_MAX;
++    auto pending = [&nextReady](uint64_t c) { if (c < nextReady) nextReady = c; };
++
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid)
+             continue;
++        if (entry.readyCycle > m_cycle)
++        {
++            pending(entry.readyCycle);
++            continue;
++        }
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -765,6 +786,8 @@ void VU1Interpreter::commitReadyPipelines()
+         entry = {};
+     }
+ 
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        pending(m_fdiv.readyCycle);
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+     {
+         m_state.q = m_fdiv.value;
+@@ -780,12 +803,19 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.p = entry.value;
+             entry = {};
+         }
++        else if (entry.valid)
++            pending(entry.readyCycle);
+     }
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid)
++            continue;
++        if (store.readyCycle > m_cycle)
++        {
++            pending(store.readyCycle);
+             continue;
++        }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -802,8 +832,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pending(write.readyCycle);
++            continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -817,8 +852,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pending(write.readyCycle);
++            continue;
++        }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
+@@ -826,8 +866,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            pending(write.readyCycle);
+             continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -838,6 +883,7 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++    m_nextReady = nextReady;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -919,6 +965,7 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
