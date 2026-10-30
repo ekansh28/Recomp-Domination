@@ -1,5 +1,30 @@
 # The front-end stall
 
+> **Read this first: measurement discipline.** Behaviour in the current tree is
+> **not deterministic when the movie diagnostic is set**, and that diagnostic
+> has been silently driving results.
+>
+> | configuration (same build, same binds, 14 s runs) | result across runs |
+> | --- | --- |
+> | `PS2X_DIAG_FORCE_MOVIE_DONE=200` | coin flip: the stall block ran 0, 255886, 0, 244269 times; CD reads 246 or 525 |
+> | the same, diagnostic unset | **identical every time**: 3/3 runs with 246 CD reads and no stall |
+>
+> So the "progress" seen in earlier rounds — more CD reads, the shell passing
+> twice as often, the stall appearing at all — was produced by that diagnostic,
+> not by the IOP module load it was being credited to. Any A/B run through this
+> diagnostic is confounded, and single runs prove nothing.
+>
+> Concretely: the earlier conclusions that the module load "takes the game
+> further", that `cdvdman` regresses the loader, and that letting the guest
+> `ioman` own its imports regresses it, were each drawn from **one or two runs of
+> a coin-flip experiment**. They need re-testing with repeats and the diagnostic
+> unset before they are relied on again. (The `cdvdman` A/B in particular was
+> also invalid by construction: the runtime skips those two modules *by name*, so
+> both directories under test loaded the same 13 modules.)
+>
+> Rule for the next round: run every comparison at least three times, with
+> `PS2X_DIAG_FORCE_MOVIE_DONE` unset unless the movie path is the subject.
+
 After the loader finishes, the game enters the shell and never leaves it: the
 frame stays black and one function runs about a million times per second while
 the shell sits still. This is that stall.
