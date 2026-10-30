@@ -27,9 +27,12 @@
 
 ## The honest baseline
 
-With the diagnostics off, the game does not stall in the shell at all — it never
-gets there. Three identical 14 s runs: 246 CD reads, no stall block, and **no
-frame-loop output at all**. The busiest code sits in the stream/movie library
+With the movie diagnostic off, the game does not stall in the shell at all — it
+never gets there. Three identical 14 s runs: 246 CD reads, the stall block never
+running, and **no frame-loop output at all**. (Those runs had the 13 default
+boot modules loaded — unsetting `PS2X_IOP_MODULES` selects the default directory;
+`PS2X_IOP_MODULES=0` is what disables the load, and that case has not been
+measured for determinism.) The busiest code sits in the stream/movie library
 (the `0x2538xx`–`0x2543f8` group and its `0x25exxx` SIF neighbours), i.e. the
 attract path. So the unassisted state is "parked in the movie stream", and
 everything that looked like progress past it came from the movie diagnostic.
