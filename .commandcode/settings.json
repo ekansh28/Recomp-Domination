@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(powershell -Command \"Get-ChildItem -Path 'analysis','.' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 30 LastWriteTime,Length,FullName | Format-Table -AutoSize | Out-String -Width 250\")",
+      "Shell(dir:*)",
+      "Shell(where:*)",
+      "Shell(C:\\Tools\\ghidra_12.1.4_PUBLIC\\support\\analyzeHeadless.bat:*)",
+      "Shell(Select-Object:*)",
+      "powershell",
+      "Shell(if:*)",
+      "Shell(Test-Path:*)",
+      "Shell({:*)",
+      "Shell(Get-ChildItem:*)",
+      "Shell(Format-Table:*)",
+      "Shell(Out-String:*)",
+      "Shell(Measure-Object:*)",
+      "Shell(.Count:*)",
+      "mcp__fetch__fetch"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}
