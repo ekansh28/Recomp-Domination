@@ -25,6 +25,21 @@
 > Rule for the next round: run every comparison at least three times, with
 > `PS2X_DIAG_FORCE_MOVIE_DONE` unset unless the movie path is the subject.
 
+## The honest baseline
+
+With the diagnostics off, the game does not stall in the shell at all — it never
+gets there. Three identical 14 s runs: 246 CD reads, no stall block, and **no
+frame-loop output at all**. The busiest code sits in the stream/movie library
+(the `0x2538xx`–`0x2543f8` group and its `0x25exxx` SIF neighbours), i.e. the
+attract path. So the unassisted state is "parked in the movie stream", and
+everything that looked like progress past it came from the movie diagnostic.
+
+That makes the movie path the critical path again, and the honest options are the
+two already scoped in `docs/mpeg-playback.md`: port the EE IPU's `IDEC`/`BDEC`
+(large), or route the demuxed PSS video through the existing FFmpeg HLE seam
+(medium, reuses code that is already in the tree). A partial IPU — bitstream
+only, no decode — is explicitly not a fix, because it produces no picture.
+
 After the loader finishes, the game enters the shell and never leaves it: the
 frame stays black and one function runs about a million times per second while
 the shell sits still. This is that stall.
